@@ -1,0 +1,20 @@
+services:
+  auto-parser:
+    build:
+      context: .
+    container_name: get-easy-auto
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./listings.db:/data/listings.db
+      - ./.cache/auto_parser/images:/data/images
+    environment:
+      TZ: Europe/Moscow
+      AUTO_RU_IMAP_HOST: ${AUTO_RU_IMAP_HOST:-}
+      AUTO_RU_IMAP_PORT: ${AUTO_RU_IMAP_PORT:-993}
+      AUTO_RU_IMAP_USERNAME: ${AUTO_RU_IMAP_USERNAME:-}
+      AUTO_RU_IMAP_PASSWORD: ${AUTO_RU_IMAP_PASSWORD:-}
+      AUTO_RU_IMAP_MAILBOX: ${AUTO_RU_IMAP_MAILBOX:-INBOX}
+      AUTO_RU_IMAP_SENDER: ${AUTO_RU_IMAP_SENDER:-auto.ru}
+      AUTO_RU_IMAP_MAX_MESSAGES: ${AUTO_RU_IMAP_MAX_MESSAGES:-100}

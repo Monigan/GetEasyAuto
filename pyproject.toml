@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "auto-listings-parser"
+version = "0.1.0"
+description = "Keyword-based car listing collector"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+[project.scripts]
+auto-parser = "auto_parser.cli:main"
+auto-viewer = "auto_parser.viewer:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/auto_parser"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

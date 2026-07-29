@@ -1,0 +1,1212 @@
+from __future__ import annotations
+
+import json
+import sqlite3
+from pathlib import Path
+from typing import Any, Iterable
+
+from auto_parser.images import (
+    avito_image_identity,
+    deduplicate_avito_image_urls,
+    deduplicate_image_urls,
+    image_identity,
+    remap_cached_avito_images,
+    remap_cached_images,
+)
+from auto_parser.models import Listing
+
+
+class ListingRepository:
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self.connection = sqlite3.connect(self.path)
+        self.connection.row_factory = sqlite3.Row
+        self._create_schema()
+
+    def _create_schema(self) -> None:
+        self.connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS listings (
+                source TEXT NOT NULL,
+                external_id TEXT NOT NULL,
+                url TEXT NOT NULL,
+                title TEXT NOT NULL,
+                price INTEGER,
+                currency TEXT,
+                description TEXT,
+                mileage_km INTEGER,
+                brand TEXT,
+                model TEXT,
+                views_count INTEGER,
+                attributes_json TEXT NOT NULL DEFAULT '{}',
+                location TEXT,
+                published_at TEXT,
+                status TEXT NOT NULL DEFAULT 'active',
+                hidden INTEGER NOT NULL DEFAULT 0,
+                last_validated_at TEXT,
+                last_detail_attempt_at TEXT,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                PRIMARY KEY (source, external_id)
+            );
+            CREATE TABLE IF NOT EXISTS price_history (
+                source TEXT NOT NULL,
+                external_id TEXT NOT NULL,
+                price INTEGER,
+                currency TEXT,
+                observed_at TEXT NOT NULL,
+                UNIQUE (source, external_id, price, currency)
+            );
+            CREATE TABLE IF NOT EXISTS listing_images (
+                source TEXT NOT NULL,
+                external_id TEXT NOT NULL,
+                image_url TEXT NOT NULL,
+                local_path TEXT,
+                cached_at TEXT NOT NULL,
+                PRIMARY KEY (source, external_id, image_url)
+            );
+            CREATE TABLE IF NOT EXISTS search_profiles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL DEFAULT 'avito',
+                query TEXT NOT NULL,
+                region TEXT NOT NULL DEFAULT 'all',
+                radius INTEGER,
+                interval_minutes INTEGER NOT NULL DEFAULT 60,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                last_run_at TEXT,
+                next_run_at TEXT,
+                last_status TEXT,
+                last_result_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                UNIQUE(source, query, region, radius)
+            );
+            CREATE TABLE IF NOT EXISTS app_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS car_parts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                car_source TEXT NOT NULL,
+                car_external_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                category TEXT NOT NULL DEFAULT 'Прочее',
+                part_number TEXT,
+                price INTEGER,
+                quantity INTEGER NOT NULL DEFAULT 1,
+                labor_cost INTEGER NOT NULL DEFAULT 0,
+                seller TEXT,
+                purchase_url TEXT,
+                description TEXT,
+                replacement_term TEXT NOT NULL DEFAULT 'Позже',
+                selected_for_replacement INTEGER NOT NULL DEFAULT 0,
+                estimated INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(car_source, car_external_id, name, seller)
+            );
+            CREATE TABLE IF NOT EXISTS garage_cars (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                listing_source TEXT,
+                listing_external_id TEXT,
+                name TEXT NOT NULL,
+                brand TEXT,
+                model TEXT,
+                year INTEGER,
+                mileage_km INTEGER,
+                vin TEXT,
+                plate_number TEXT,
+                purchase_date TEXT,
+                purchase_price INTEGER,
+                attributes_json TEXT NOT NULL DEFAULT '{}',
+                notes TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(listing_source, listing_external_id)
+            );
+            CREATE TABLE IF NOT EXISTS garage_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                garage_id INTEGER NOT NULL,
+                entry_type TEXT NOT NULL DEFAULT 'journal',
+                title TEXT NOT NULL,
+                description TEXT,
+                category TEXT,
+                occurred_at TEXT NOT NULL,
+                mileage_km INTEGER,
+                cost INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(garage_id) REFERENCES garage_cars(id)
+                    ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS mail_imports (
+                message_id TEXT PRIMARY KEY,
+                sender TEXT,
+                subject TEXT,
+                received_at TEXT,
+                processed_at TEXT NOT NULL,
+                listing_count INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS notification_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                query TEXT,
+                brands_json TEXT NOT NULL DEFAULT '[]',
+                models_json TEXT NOT NULL DEFAULT '[]',
+                colors_json TEXT NOT NULL DEFAULT '[]',
+                engines_json TEXT NOT NULL DEFAULT '[]',
+                min_price INTEGER,
+                max_price INTEGER,
+                max_mileage INTEGER,
+                min_year INTEGER,
+                max_year INTEGER,
+                min_power INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rule_id INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                external_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                message TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                read_at TEXT,
+                UNIQUE(rule_id, source, external_id),
+                FOREIGN KEY(rule_id) REFERENCES notification_rules(id)
+                    ON DELETE CASCADE
+            );
+            """
+        )
+        part_columns = {
+            row["name"]
+            for row in self.connection.execute("PRAGMA table_info(car_parts)")
+        }
+        if "garage_id" not in part_columns:
+            self.connection.execute(
+                "ALTER TABLE car_parts ADD COLUMN garage_id INTEGER"
+            )
+        profile_columns = {
+            row["name"]
+            for row in self.connection.execute(
+                "PRAGMA table_info(search_profiles)"
+            )
+        }
+        if "source" not in profile_columns:
+            self.connection.execute(
+                "ALTER TABLE search_profiles "
+                "ADD COLUMN source TEXT NOT NULL DEFAULT 'avito'"
+            )
+        profile_schema_row = self.connection.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'search_profiles'"
+        ).fetchone()
+        profile_schema = "".join(
+            str(profile_schema_row["sql"] if profile_schema_row else "").split()
+        ).lower()
+        if "unique(query,region,radius)" in profile_schema:
+            self.connection.executescript(
+                """
+                CREATE TABLE search_profiles_v2 (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source TEXT NOT NULL DEFAULT 'avito',
+                    query TEXT NOT NULL,
+                    region TEXT NOT NULL DEFAULT 'all',
+                    radius INTEGER,
+                    interval_minutes INTEGER NOT NULL DEFAULT 60,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    last_run_at TEXT,
+                    next_run_at TEXT,
+                    last_status TEXT,
+                    last_result_count INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(source, query, region, radius)
+                );
+                INSERT INTO search_profiles_v2 (
+                    id, source, query, region, radius, interval_minutes,
+                    enabled, last_run_at, next_run_at, last_status,
+                    last_result_count, created_at
+                )
+                SELECT
+                    id, source, query, region, radius, interval_minutes,
+                    enabled, last_run_at, next_run_at, last_status,
+                    last_result_count, created_at
+                FROM search_profiles;
+                DROP TABLE search_profiles;
+                ALTER TABLE search_profiles_v2 RENAME TO search_profiles;
+                """
+            )
+        columns = {
+            row["name"]
+            for row in self.connection.execute("PRAGMA table_info(listings)")
+        }
+        if "description" not in columns:
+            self.connection.execute(
+                "ALTER TABLE listings ADD COLUMN description TEXT"
+            )
+        if "mileage_km" not in columns:
+            self.connection.execute(
+                "ALTER TABLE listings ADD COLUMN mileage_km INTEGER"
+            )
+        migrations = {
+            "brand": "ALTER TABLE listings ADD COLUMN brand TEXT",
+            "model": "ALTER TABLE listings ADD COLUMN model TEXT",
+            "views_count": "ALTER TABLE listings ADD COLUMN views_count INTEGER",
+            "attributes_json": (
+                "ALTER TABLE listings ADD COLUMN "
+                "attributes_json TEXT NOT NULL DEFAULT '{}'"
+            ),
+            "status": (
+                "ALTER TABLE listings ADD COLUMN "
+                "status TEXT NOT NULL DEFAULT 'active'"
+            ),
+            "hidden": (
+                "ALTER TABLE listings ADD COLUMN "
+                "hidden INTEGER NOT NULL DEFAULT 0"
+            ),
+            "last_validated_at": (
+                "ALTER TABLE listings ADD COLUMN last_validated_at TEXT"
+            ),
+            "last_detail_attempt_at": (
+                "ALTER TABLE listings ADD COLUMN last_detail_attempt_at TEXT"
+            ),
+        }
+        for column, statement in migrations.items():
+            if column not in columns:
+                self.connection.execute(statement)
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS listings_brand_idx ON listings(brand)"
+        )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS garage_cars_updated_idx "
+            "ON garage_cars(updated_at DESC)"
+        )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS garage_entries_car_idx "
+            "ON garage_entries(garage_id, occurred_at DESC)"
+        )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS car_parts_garage_idx "
+            "ON car_parts(garage_id, selected_for_replacement)"
+        )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS listings_status_idx ON listings(status)"
+        )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS listings_hidden_idx ON listings(hidden)"
+        )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS notifications_unread_idx "
+            "ON notifications(read_at, created_at DESC)"
+        )
+        self.connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS listings_recent_idx
+            ON listings(hidden, last_seen_at DESC)
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS listings_added_idx
+            ON listings(hidden, first_seen_at DESC)
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS listings_detail_refresh_idx
+            ON listings(source, status, last_detail_attempt_at)
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS car_parts_car_idx
+            ON car_parts(car_source, car_external_id)
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS car_parts_plan_idx
+            ON car_parts(
+                car_source, car_external_id,
+                selected_for_replacement, replacement_term
+            )
+            """
+        )
+        self.connection.execute(
+            """
+            UPDATE listings
+            SET brand = CASE
+                WHEN INSTR(title, ' ') > 0
+                THEN SUBSTR(title, 1, INSTR(title, ' ') - 1)
+                ELSE title
+            END
+            WHERE brand IS NULL OR brand = ''
+            """
+        )
+        self._migrate_duplicate_image_variants()
+        self.connection.commit()
+
+    def _migrate_duplicate_image_variants(self) -> None:
+        migration_key = "deduplicate_avito_image_variants_v2"
+        completed = self.connection.execute(
+            "SELECT 1 FROM app_metadata WHERE key = ?",
+            (migration_key,),
+        ).fetchone()
+        if completed:
+            return
+
+        rows = self.connection.execute(
+            """
+            SELECT source, external_id, image_url, local_path, cached_at
+            FROM listing_images
+            WHERE source = 'avito'
+            ORDER BY source, external_id, rowid
+            """
+        ).fetchall()
+        grouped: dict[tuple[str, str], list[sqlite3.Row]] = {}
+        for row in rows:
+            key = (row["source"], row["external_id"])
+            grouped.setdefault(key, []).append(row)
+
+        for (source, external_id), image_rows in grouped.items():
+            urls = [row["image_url"] for row in image_rows]
+            selected = deduplicate_avito_image_urls(urls)
+            cached = remap_cached_avito_images(
+                selected,
+                {
+                    row["image_url"]: row["local_path"]
+                    for row in image_rows
+                    if row["local_path"]
+                },
+            )
+            cached_at = max(row["cached_at"] for row in image_rows)
+            self.connection.execute(
+                """
+                DELETE FROM listing_images
+                WHERE source = ? AND external_id = ?
+                """,
+                (source, external_id),
+            )
+            for image_url in selected:
+                self.connection.execute(
+                    """
+                    INSERT INTO listing_images (
+                        source, external_id, image_url, local_path, cached_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        source,
+                        external_id,
+                        image_url,
+                        cached.get(image_url),
+                        cached_at,
+                    ),
+                )
+
+        self.connection.execute(
+            """
+            INSERT OR REPLACE INTO app_metadata (key, value)
+            VALUES (?, 'complete')
+            """,
+            (migration_key,),
+        )
+
+    def upsert_many(self, listings: Iterable[Listing]) -> int:
+        count = 0
+        for listing in listings:
+            listing.image_urls = deduplicate_image_urls(listing.image_urls)
+            self.connection.execute(
+                """
+                INSERT INTO listings (
+                    source, external_id, url, title, price, currency, description,
+                    mileage_km, brand, model, views_count, attributes_json,
+                    location, published_at, status, last_validated_at,
+                    first_seen_at, last_seen_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source, external_id) DO UPDATE SET
+                    url = excluded.url,
+                    title = excluded.title,
+                    price = COALESCE(excluded.price, listings.price),
+                    currency = COALESCE(excluded.currency, listings.currency),
+                    description = COALESCE(
+                        excluded.description, listings.description
+                    ),
+                    mileage_km = COALESCE(
+                        excluded.mileage_km, listings.mileage_km
+                    ),
+                    brand = COALESCE(excluded.brand, listings.brand),
+                    model = COALESCE(excluded.model, listings.model),
+                    views_count = COALESCE(
+                        excluded.views_count, listings.views_count
+                    ),
+                    attributes_json = CASE
+                        WHEN excluded.attributes_json = '{}'
+                        THEN listings.attributes_json
+                        ELSE excluded.attributes_json
+                    END,
+                    location = COALESCE(excluded.location, listings.location),
+                    published_at = COALESCE(
+                        excluded.published_at, listings.published_at
+                    ),
+                    status = excluded.status,
+                    last_validated_at = COALESCE(
+                        excluded.last_validated_at, listings.last_validated_at
+                    ),
+                    last_seen_at = excluded.last_seen_at
+                """,
+                (
+                    listing.source,
+                    listing.external_id,
+                    listing.url,
+                    listing.title,
+                    listing.price,
+                    listing.currency,
+                    listing.description,
+                    listing.mileage_km,
+                    listing.brand,
+                    listing.model,
+                    listing.views_count,
+                    json.dumps(listing.attributes, ensure_ascii=False),
+                    listing.location,
+                    listing.published_at,
+                    listing.status,
+                    listing.last_validated_at,
+                    listing.collected_at,
+                    listing.collected_at,
+                ),
+            )
+            self.connection.execute(
+                """
+                INSERT OR IGNORE INTO price_history (
+                    source, external_id, price, currency, observed_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    listing.source,
+                    listing.external_id,
+                    listing.price,
+                    listing.currency,
+                    listing.collected_at,
+                ),
+            )
+            existing_by_identity: dict[str, list[sqlite3.Row]] = {}
+            if listing.image_urls:
+                existing_rows = self.connection.execute(
+                    """
+                    SELECT image_url, local_path FROM listing_images
+                    WHERE source = ? AND external_id = ?
+                    """,
+                    (listing.source, listing.external_id),
+                ).fetchall()
+                for existing in existing_rows:
+                    existing_by_identity.setdefault(
+                        image_identity(existing["image_url"]),
+                        [],
+                    ).append(existing)
+            for image_url in listing.image_urls:
+                local_path = listing.cached_images.get(image_url)
+                identity = image_identity(image_url)
+                if identity:
+                    for existing in existing_by_identity.get(
+                        identity,
+                        [],
+                    ):
+                        local_path = local_path or existing["local_path"]
+                        if existing["image_url"] != image_url:
+                            self.connection.execute(
+                                """
+                                DELETE FROM listing_images
+                                WHERE source = ? AND external_id = ?
+                                  AND image_url = ?
+                                """,
+                                (
+                                    listing.source,
+                                    listing.external_id,
+                                    existing["image_url"],
+                                ),
+                            )
+                self.connection.execute(
+                    """
+                    INSERT INTO listing_images (
+                        source, external_id, image_url, local_path, cached_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(source, external_id, image_url) DO UPDATE SET
+                        local_path = COALESCE(
+                            excluded.local_path, listing_images.local_path
+                        ),
+                        cached_at = excluded.cached_at
+                    """,
+                    (
+                        listing.source,
+                        listing.external_id,
+                        image_url,
+                        local_path,
+                        listing.collected_at,
+                    ),
+                )
+            self._create_listing_notifications(listing)
+            count += 1
+        self.connection.commit()
+        return count
+
+    def _create_listing_notifications(self, listing: Listing) -> int:
+        rules = self.connection.execute(
+            "SELECT * FROM notification_rules WHERE enabled = 1 ORDER BY id"
+        ).fetchall()
+        created = 0
+        for rule in rules:
+            if not _listing_matches_notification_rule(listing, rule):
+                continue
+            cursor = self.connection.execute(
+                """
+                INSERT OR IGNORE INTO notifications (
+                    rule_id, source, external_id, title, message, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    rule["id"],
+                    listing.source,
+                    listing.external_id,
+                    listing.title,
+                    _notification_message(listing, str(rule["name"])),
+                    listing.collected_at,
+                ),
+            )
+            created += max(0, cursor.rowcount)
+        return created
+
+    def mail_import_processed(self, message_id: str) -> bool:
+        return self.connection.execute(
+            "SELECT 1 FROM mail_imports WHERE message_id = ?",
+            (message_id,),
+        ).fetchone() is not None
+
+    def record_mail_import(
+        self,
+        *,
+        message_id: str,
+        sender: str | None,
+        subject: str | None,
+        received_at: str | None,
+        processed_at: str,
+        listing_count: int,
+    ) -> None:
+        self.connection.execute(
+            """
+            INSERT OR REPLACE INTO mail_imports (
+                message_id, sender, subject, received_at,
+                processed_at, listing_count
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                message_id,
+                sender,
+                subject,
+                received_at,
+                processed_at,
+                listing_count,
+            ),
+        )
+        self.connection.commit()
+
+    def notification_rules(self) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            "SELECT * FROM notification_rules ORDER BY created_at DESC"
+        ).fetchall()
+
+    def add_notification_rule(self, fields: dict[str, Any], *, now: str) -> int:
+        cursor = self.connection.execute(
+            """
+            INSERT INTO notification_rules (
+                name, enabled, query, brands_json, models_json,
+                colors_json, engines_json, min_price, max_price,
+                max_mileage, min_year, max_year, min_power,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            _notification_rule_values(fields, now=now),
+        )
+        rule_id = int(cursor.lastrowid)
+        self.connection.commit()
+        self.evaluate_notification_rule(rule_id)
+        return rule_id
+
+    def update_notification_rule(
+        self,
+        rule_id: int,
+        fields: dict[str, Any],
+        *,
+        now: str,
+    ) -> bool:
+        existing = self.connection.execute(
+            "SELECT * FROM notification_rules WHERE id = ?",
+            (rule_id,),
+        ).fetchone()
+        if existing is None:
+            return False
+        merged = dict(existing)
+        merged.update(fields)
+        values = _notification_rule_values(merged, now=now)
+        cursor = self.connection.execute(
+            """
+            UPDATE notification_rules SET
+                name = ?, enabled = ?, query = ?, brands_json = ?,
+                models_json = ?, colors_json = ?, engines_json = ?,
+                min_price = ?, max_price = ?, max_mileage = ?,
+                min_year = ?, max_year = ?, min_power = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (*values[:13], now, rule_id),
+        )
+        self.connection.commit()
+        if cursor.rowcount:
+            self.evaluate_notification_rule(rule_id)
+        return cursor.rowcount > 0
+
+    def delete_notification_rule(self, rule_id: int) -> bool:
+        cursor = self.connection.execute(
+            "DELETE FROM notification_rules WHERE id = ?",
+            (rule_id,),
+        )
+        self.connection.commit()
+        return cursor.rowcount > 0
+
+    def evaluate_notification_rule(self, rule_id: int) -> int:
+        rule = self.connection.execute(
+            "SELECT * FROM notification_rules WHERE id = ? AND enabled = 1",
+            (rule_id,),
+        ).fetchone()
+        if rule is None:
+            return 0
+        rows = self.connection.execute(
+            "SELECT * FROM listings WHERE status = 'active'"
+        ).fetchall()
+        created = 0
+        for row in rows:
+            listing = self._row_to_listing(row)
+            if not _listing_matches_notification_rule(listing, rule):
+                continue
+            cursor = self.connection.execute(
+                """
+                INSERT OR IGNORE INTO notifications (
+                    rule_id, source, external_id, title, message, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    rule_id,
+                    listing.source,
+                    listing.external_id,
+                    listing.title,
+                    _notification_message(listing, str(rule["name"])),
+                    listing.collected_at,
+                ),
+            )
+            created += max(0, cursor.rowcount)
+        self.connection.commit()
+        return created
+
+    def notifications(self, *, unread_only: bool = False) -> list[sqlite3.Row]:
+        where = "WHERE n.read_at IS NULL" if unread_only else ""
+        return self.connection.execute(
+            f"""
+            SELECT n.*, r.name AS rule_name, l.url, l.price, l.mileage_km,
+                   l.brand, l.model
+            FROM notifications n
+            JOIN notification_rules r ON r.id = n.rule_id
+            LEFT JOIN listings l
+              ON l.source = n.source AND l.external_id = n.external_id
+            {where}
+            ORDER BY n.created_at DESC, n.id DESC
+            LIMIT 200
+            """
+        ).fetchall()
+
+    def mark_notification_read(self, notification_id: int, *, read_at: str) -> bool:
+        cursor = self.connection.execute(
+            "UPDATE notifications SET read_at = COALESCE(read_at, ?) WHERE id = ?",
+            (read_at, notification_id),
+        )
+        self.connection.commit()
+        return cursor.rowcount > 0
+
+    def mark_all_notifications_read(self, *, read_at: str) -> int:
+        cursor = self.connection.execute(
+            "UPDATE notifications SET read_at = ? WHERE read_at IS NULL",
+            (read_at,),
+        )
+        self.connection.commit()
+        return max(0, cursor.rowcount)
+
+    def list_for_validation(
+        self,
+        *,
+        due_before: str | None = None,
+        limit: int = 100,
+    ) -> list[Listing]:
+        conditions = ["status = 'active'"]
+        values: list[Any] = []
+        if due_before is not None:
+            conditions.append(
+                "(last_validated_at IS NULL OR last_validated_at <= ?)"
+            )
+            values.append(due_before)
+        rows = self.connection.execute(
+            f"""
+            SELECT * FROM listings
+            WHERE {" AND ".join(conditions)}
+            ORDER BY COALESCE(last_validated_at, first_seen_at)
+            LIMIT ?
+            """,
+            (*values, max(1, limit)),
+        ).fetchall()
+        return [self._row_to_listing(row) for row in rows]
+
+    def get_listing(self, source: str, external_id: str) -> Listing | None:
+        row = self.connection.execute(
+            """
+            SELECT * FROM listings
+            WHERE source = ? AND external_id = ?
+            """,
+            (source, external_id),
+        ).fetchone()
+        if row is None:
+            return None
+        listing = self._row_to_listing(row)
+        images = self.connection.execute(
+            """
+            SELECT image_url, local_path FROM listing_images
+            WHERE source = ? AND external_id = ?
+            ORDER BY rowid
+            """,
+            (source, external_id),
+        ).fetchall()
+        listing.image_urls = [image["image_url"] for image in images]
+        raw_cached_images = {
+            image["image_url"]: image["local_path"]
+            for image in images
+            if image["local_path"]
+        }
+        listing.image_urls = deduplicate_image_urls(listing.image_urls)
+        listing.cached_images = remap_cached_images(
+            listing.image_urls,
+            raw_cached_images,
+        )
+        return listing
+
+    def replace_listing_images(self, listing: Listing) -> None:
+        image_urls = deduplicate_image_urls(listing.image_urls)
+        cached_images = remap_cached_images(image_urls, listing.cached_images)
+        self.connection.execute(
+            """
+            DELETE FROM listing_images
+            WHERE source = ? AND external_id = ?
+            """,
+            (listing.source, listing.external_id),
+        )
+        for image_url in image_urls:
+            self.connection.execute(
+                """
+                INSERT INTO listing_images (
+                    source, external_id, image_url, local_path, cached_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    listing.source,
+                    listing.external_id,
+                    image_url,
+                    cached_images.get(image_url),
+                    listing.collected_at,
+                ),
+            )
+        self.connection.commit()
+
+    def list_for_enrichment(
+        self,
+        source: str,
+        external_ids: list[str],
+    ) -> list[Listing]:
+        if not external_ids:
+            return []
+        placeholders = ", ".join("?" for _ in external_ids)
+        rows = self.connection.execute(
+            f"""
+            SELECT source, external_id FROM listings
+            WHERE source = ?
+              AND external_id IN ({placeholders})
+              AND (
+                description IS NULL
+                OR TRIM(description) = ''
+                OR NOT EXISTS (
+                    SELECT 1 FROM listing_images i
+                    WHERE i.source = listings.source
+                      AND i.external_id = listings.external_id
+                      AND i.image_url LIKE 'https://%.img.avito.st/%'
+                )
+                OR EXISTS (
+                    SELECT 1 FROM listing_images i
+                    WHERE i.source = listings.source
+                      AND i.external_id = listings.external_id
+                      AND i.image_url GLOB
+                          '*/image/1/1.??????a3*'
+                )
+              )
+            ORDER BY COALESCE(last_detail_attempt_at, first_seen_at)
+            """,
+            (source, *external_ids),
+        ).fetchall()
+        listings = []
+        for row in rows:
+            listing = self.get_listing(row["source"], row["external_id"])
+            if listing is not None:
+                listings.append(listing)
+        return listings
+
+    def list_for_detail_refresh(
+        self,
+        source: str,
+        *,
+        incomplete_due_before: str,
+        stale_due_before: str,
+        limit: int = 10,
+    ) -> list[Listing]:
+        incomplete = """
+            description IS NULL
+            OR TRIM(description) = ''
+            OR attributes_json IS NULL
+            OR attributes_json = '{}'
+            OR NOT EXISTS (
+                SELECT 1 FROM listing_images i
+                WHERE i.source = listings.source
+                  AND i.external_id = listings.external_id
+                  AND i.image_url LIKE 'https://%'
+            )
+        """
+        rows = self.connection.execute(
+            f"""
+            SELECT source, external_id FROM listings
+            WHERE source = ?
+              AND status = 'active'
+              AND (
+                (({incomplete}) AND (
+                    last_detail_attempt_at IS NULL
+                    OR last_detail_attempt_at <= ?
+                ))
+                OR last_detail_attempt_at IS NULL
+                OR last_detail_attempt_at <= ?
+              )
+            ORDER BY
+                CASE WHEN ({incomplete}) THEN 0 ELSE 1 END,
+                COALESCE(last_detail_attempt_at, first_seen_at)
+            LIMIT ?
+            """,
+            (
+                source,
+                incomplete_due_before,
+                stale_due_before,
+                max(1, limit),
+            ),
+        ).fetchall()
+        listings = []
+        for row in rows:
+            listing = self.get_listing(row["source"], row["external_id"])
+            if listing is not None:
+                listings.append(listing)
+        return listings
+
+    def mark_detail_attempted(
+        self,
+        source: str,
+        external_id: str,
+        attempted_at: str,
+    ) -> None:
+        self.connection.execute(
+            """
+            UPDATE listings SET last_detail_attempt_at = ?
+            WHERE source = ? AND external_id = ?
+            """,
+            (attempted_at, source, external_id),
+        )
+        self.connection.commit()
+
+    def set_listing_hidden(
+        self,
+        source: str,
+        external_id: str,
+        hidden: bool,
+    ) -> bool:
+        cursor = self.connection.execute(
+            """
+            UPDATE listings SET hidden = ?
+            WHERE source = ? AND external_id = ?
+            """,
+            (1 if hidden else 0, source, external_id),
+        )
+        self.connection.commit()
+        return cursor.rowcount > 0
+
+    def mark_inactive(
+        self, source: str, external_id: str, validated_at: str
+    ) -> None:
+        self.connection.execute(
+            """
+            UPDATE listings
+            SET status = 'inactive', last_validated_at = ?, last_seen_at = ?
+            WHERE source = ? AND external_id = ?
+            """,
+            (validated_at, validated_at, source, external_id),
+        )
+        self.connection.commit()
+
+    def search_profiles(self, *, due_before: str | None = None) -> list[sqlite3.Row]:
+        if due_before is None:
+            return self.connection.execute(
+                "SELECT * FROM search_profiles ORDER BY created_at"
+            ).fetchall()
+        return self.connection.execute(
+            """
+            SELECT * FROM search_profiles
+            WHERE enabled = 1
+              AND (next_run_at IS NULL OR next_run_at <= ?)
+            ORDER BY COALESCE(next_run_at, created_at)
+            """,
+            (due_before,),
+        ).fetchall()
+
+    def add_search_profile(
+        self,
+        *,
+        source: str = "avito",
+        query: str,
+        region: str,
+        radius: int | None,
+        interval_minutes: int,
+        created_at: str,
+    ) -> int:
+        cursor = self.connection.execute(
+            """
+            INSERT INTO search_profiles (
+                source, query, region, radius, interval_minutes,
+                created_at, next_run_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                source, query, region, radius, interval_minutes,
+                created_at, created_at,
+            ),
+        )
+        self.connection.commit()
+        return int(cursor.lastrowid)
+
+    def update_search_profile(
+        self, profile_id: int, fields: dict[str, Any]
+    ) -> bool:
+        allowed = {
+            "source",
+            "query",
+            "region",
+            "radius",
+            "interval_minutes",
+            "enabled",
+            "next_run_at",
+        }
+        selected = {key: value for key, value in fields.items() if key in allowed}
+        if not selected:
+            return False
+        assignments = ", ".join(f"{key} = ?" for key in selected)
+        cursor = self.connection.execute(
+            f"UPDATE search_profiles SET {assignments} WHERE id = ?",
+            [*selected.values(), profile_id],
+        )
+        self.connection.commit()
+        return cursor.rowcount > 0
+
+    def delete_search_profile(self, profile_id: int) -> bool:
+        cursor = self.connection.execute(
+            "DELETE FROM search_profiles WHERE id = ?", (profile_id,)
+        )
+        self.connection.commit()
+        return cursor.rowcount > 0
+
+    def finish_search_profile(
+        self,
+        profile_id: int,
+        *,
+        last_run_at: str,
+        next_run_at: str,
+        status: str,
+        result_count: int,
+    ) -> None:
+        self.connection.execute(
+            """
+            UPDATE search_profiles
+            SET last_run_at = ?, next_run_at = ?, last_status = ?,
+                last_result_count = ?
+            WHERE id = ?
+            """,
+            (last_run_at, next_run_at, status, result_count, profile_id),
+        )
+        self.connection.commit()
+
+    def begin_search_profile(self, profile_id: int, *, started_at: str) -> None:
+        self.connection.execute(
+            """
+            UPDATE search_profiles
+            SET last_run_at = ?, last_status = 'running'
+            WHERE id = ?
+            """,
+            (started_at, profile_id),
+        )
+        self.connection.commit()
+
+    @staticmethod
+    def _row_to_listing(row: sqlite3.Row) -> Listing:
+        try:
+            attributes = json.loads(row["attributes_json"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            attributes = {}
+        return Listing(
+            source=row["source"],
+            external_id=row["external_id"],
+            url=row["url"],
+            title=row["title"],
+            price=row["price"],
+            currency=row["currency"],
+            description=row["description"],
+            mileage_km=row["mileage_km"],
+            brand=row["brand"],
+            model=row["model"],
+            views_count=row["views_count"],
+            attributes=attributes,
+            location=row["location"],
+            published_at=row["published_at"],
+            status=row["status"],
+            last_validated_at=row["last_validated_at"],
+            collected_at=row["last_seen_at"],
+        )
+
+    def close(self) -> None:
+        self.connection.close()
+
+    def __enter__(self) -> "ListingRepository":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+
+def _json_string_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            decoded = [item.strip() for item in value.split(",")]
+    else:
+        decoded = value
+    if not isinstance(decoded, list):
+        return []
+    return list(dict.fromkeys(
+        " ".join(str(item).split())
+        for item in decoded
+        if str(item).strip()
+    ))
+
+
+def _optional_int(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _notification_rule_values(fields: dict[str, Any], *, now: str) -> tuple[Any, ...]:
+    return (
+        " ".join(str(fields.get("name") or "Новая подборка").split()),
+        1 if fields.get("enabled", True) else 0,
+        " ".join(str(fields.get("query") or "").split()) or None,
+        json.dumps(_json_string_list(fields.get("brands", fields.get("brands_json", []))), ensure_ascii=False),
+        json.dumps(_json_string_list(fields.get("models", fields.get("models_json", []))), ensure_ascii=False),
+        json.dumps(_json_string_list(fields.get("colors", fields.get("colors_json", []))), ensure_ascii=False),
+        json.dumps(_json_string_list(fields.get("engines", fields.get("engines_json", []))), ensure_ascii=False),
+        _optional_int(fields.get("min_price")),
+        _optional_int(fields.get("max_price")),
+        _optional_int(fields.get("max_mileage")),
+        _optional_int(fields.get("min_year")),
+        _optional_int(fields.get("max_year")),
+        _optional_int(fields.get("min_power")),
+        str(fields.get("created_at") or now),
+        now,
+    )
+
+
+def _attribute_number(listing: Listing, *names: str) -> int | None:
+    for name in names:
+        value = listing.attributes.get(name)
+        if value:
+            digits = "".join(character for character in value if character.isdigit())
+            if digits:
+                return int(digits)
+    return None
+
+
+def _matches_selected(value: str | None, selected: list[str]) -> bool:
+    if not selected:
+        return True
+    normalized = (value or "").casefold()
+    return any(item.casefold() in normalized for item in selected)
+
+
+def _listing_matches_notification_rule(
+    listing: Listing,
+    rule: sqlite3.Row,
+) -> bool:
+    query = str(rule["query"] or "").casefold()
+    searchable = " ".join(
+        filter(None, [listing.title, listing.brand, listing.model, listing.description])
+    ).casefold()
+    if query and not all(token in searchable for token in query.split()):
+        return False
+    if not _matches_selected(listing.brand, _json_string_list(rule["brands_json"])):
+        return False
+    if not _matches_selected(listing.model, _json_string_list(rule["models_json"])):
+        return False
+    color = listing.attributes.get("Цвет")
+    if not _matches_selected(color, _json_string_list(rule["colors_json"])):
+        return False
+    engine = listing.attributes.get("Тип двигателя") or listing.attributes.get("Двигатель")
+    if not _matches_selected(engine, _json_string_list(rule["engines_json"])):
+        return False
+    minimum_price = _optional_int(rule["min_price"])
+    maximum_price = _optional_int(rule["max_price"])
+    if minimum_price is not None and (listing.price is None or listing.price < minimum_price):
+        return False
+    if maximum_price is not None and (listing.price is None or listing.price > maximum_price):
+        return False
+    maximum_mileage = _optional_int(rule["max_mileage"])
+    if maximum_mileage is not None and (
+        listing.mileage_km is None or listing.mileage_km > maximum_mileage
+    ):
+        return False
+    year = _attribute_number(listing, "Год выпуска", "Год")
+    minimum_year = _optional_int(rule["min_year"])
+    maximum_year = _optional_int(rule["max_year"])
+    if minimum_year is not None and (year is None or year < minimum_year):
+        return False
+    if maximum_year is not None and (year is None or year > maximum_year):
+        return False
+    minimum_power = _optional_int(rule["min_power"])
+    power = _attribute_number(listing, "Мощность", "Мощность двигателя")
+    if minimum_power is not None and (power is None or power < minimum_power):
+        return False
+    return True
+
+
+def _notification_message(listing: Listing, rule_name: str) -> str:
+    details: list[str] = []
+    if listing.price is not None:
+        details.append(f"{listing.price:,} ₽".replace(",", " "))
+    if listing.mileage_km is not None:
+        details.append(f"{listing.mileage_km:,} км".replace(",", " "))
+    suffix = f": {', '.join(details)}" if details else ""
+    return f"Подходит под критерий «{rule_name}»{suffix}"
