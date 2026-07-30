@@ -65,6 +65,293 @@ class DeferredSearchService:
 
 
 class ViewerTests(unittest.TestCase):
+    def test_listing_uses_drom_trim_fallback_date_and_saved_analysis(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "listings.db"
+            cache = root / "images"
+            cache.mkdir()
+            with ListingRepository(database) as repository:
+                repository.upsert_many(
+                    [
+                        Listing(
+                            source="drom",
+                            external_id="trim-source",
+                            url="https://auto.drom.ru/bmw/trim-source.html",
+                            title="BMW 3-Series, 1995",
+                            brand="BMW",
+                            model="3-Series",
+                            attributes={
+                                "Год выпуска": "1995",
+                                "Комплектация": "316i MT",
+                            },
+                        ),
+                        Listing(
+                            source="avito",
+                            external_id="target",
+                            url="https://www.avito.ru/bmw-target",
+                            title="BMW 3 серия, 1995",
+                            brand="BMW",
+                            model="3 серия",
+                            description="Помпа заменена",
+                            attributes={"Год выпуска": "1995"},
+                            collected_at="2026-07-30T08:00:00+00:00",
+                        ),
+                    ]
+                )
+            handler = type(
+                "TestVehicleKnowledgeViewerHandler",
+                (ViewerHandler,),
+                {"database": database, "cache_dir": cache},
+            )
+            server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base_url = f"http://127.0.0.1:{server.server_port}"
+            try:
+                with urlopen(
+                    f"{base_url}/api/listings?source=avito",
+                    timeout=5,
+                ) as response:
+                    before = json.load(response)["items"][0]
+                save_request = Request(
+                    f"{base_url}/api/vehicle-analysis",
+                    data=json.dumps(
+                        {
+                            "source": "avito",
+                            "external_id": "target",
+                            "analysis": {
+                                "model_analysis": {
+                                    "summary": "Проверить охлаждение",
+                                    "weak_points": [
+                                        {
+                                            "id": "cooling",
+                                            "issue": "Помпа",
+                                            "parts_cost_min": 10000,
+                                            "parts_cost_max": 20000,
+                                        }
+                                    ],
+                                },
+                                "listing_assessment": {
+                                    "confirmed_maintenance": [
+                                        {
+                                            "item": "Помпа",
+                                            "evidence": "Помпа заменена",
+                                        }
+                                    ],
+                                    "excluded_weak_point_ids": ["cooling"],
+                                    "relevant_weak_point_ids": [],
+                                    "parts_investment_total": {
+                                        "min": 0,
+                                        "max": 0,
+                                    },
+                                },
+                            },
+                        }
+                    ).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urlopen(save_request, timeout=5) as response:
+                    saved = json.load(response)
+                with urlopen(
+                    f"{base_url}/api/listings?source=avito",
+                    timeout=5,
+                ) as response:
+                    after = json.load(response)["items"][0]
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+        self.assertTrue(before["published_at_inferred"])
+        self.assertEqual(
+            before["published_at"],
+            "2026-07-30T08:00:00+00:00",
+        )
+        self.assertFalse(before["trim_exact"])
+        self.assertEqual(before["trim_options"][0]["name"], "316i MT")
+        self.assertIn("drive2.ru/search", before["drive2_url"])
+        self.assertTrue(saved["saved"])
+        self.assertEqual(
+            after["vehicle_analysis"]["data"]["summary"],
+            "Проверить охлаждение",
+        )
+        self.assertEqual(
+            after["listing_assessment"]["data"][
+                "excluded_weak_point_ids"
+            ],
+            ["cooling"],
+        )
+        self.assertEqual(
+            after["listing_assessment"]["description_snapshot"],
+            "Помпа заменена",
+        )
+        self.assertEqual(
+            after["vehicle_analysis"]["data"]["weak_points"][0][
+                "parts_cost_min"
+            ],
+            10000,
+        )
+
+    def test_displayed_listings_endpoint_tracks_current_catalog_page(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "listings.db"
+            cache = root / "images"
+            cache.mkdir()
+            with ListingRepository(database):
+                pass
+            handler = type(
+                "TestDisplayedViewerHandler",
+                (ViewerHandler,),
+                {"database": database, "cache_dir": cache},
+            )
+            server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            request = Request(
+                (
+                    f"http://127.0.0.1:{server.server_port}"
+                    "/api/displayed-listings"
+                ),
+                data=json.dumps(
+                    {
+                        "client_id": "browser-test",
+                        "items": [
+                            {
+                                "source": "drom",
+                                "external_id": "visible-car",
+                            }
+                        ],
+                    }
+                ).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urlopen(request, timeout=5) as response:
+                    result = json.load(response)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+            with ListingRepository(database) as repository:
+                tracked = repository.connection.execute(
+                    """
+                    SELECT source, external_id FROM displayed_listings
+                    WHERE client_id = 'browser-test'
+                    """
+                ).fetchall()
+
+        self.assertEqual(result["tracked"], 1)
+        self.assertEqual(
+            [(row["source"], row["external_id"]) for row in tracked],
+            [("drom", "visible-car")],
+        )
+
+    def test_source_filter_price_changes_and_sold_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "listings.db"
+            cache = root / "images"
+            cache.mkdir()
+            with ListingRepository(database) as repository:
+                avito = Listing(
+                    source="avito",
+                    external_id="active",
+                    url="https://www.avito.ru/item_active",
+                    title="BMW 520i",
+                    price=600_000,
+                    brand="BMW",
+                )
+                repository.upsert_many([avito])
+                avito.price = 550_000
+                avito.collected_at = "2026-07-30T18:00:00+00:00"
+                repository.upsert_many([avito])
+                repository.upsert_many(
+                    [
+                        Listing(
+                            source="drom",
+                            external_id="sold",
+                            url="https://auto.drom.ru/sold.html",
+                            title="BMW 525i",
+                            price=500_000,
+                            brand="BMW",
+                        )
+                    ]
+                )
+                repository.mark_sold(
+                    "drom",
+                    "sold",
+                    "2026-07-29T19:00:00+00:00",
+                )
+                repository.upsert_many(
+                    [
+                        Listing(
+                            source="avito",
+                            external_id="hidden-by-source",
+                            url="https://www.avito.ru/item_hidden",
+                            title="BMW 528i",
+                            price=580_000,
+                            brand="BMW",
+                            status="hidden",
+                        )
+                    ]
+                )
+
+            handler = type(
+                "TestSoldViewerHandler",
+                (ViewerHandler,),
+                {"database": database, "cache_dir": cache},
+            )
+            server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base_url = f"http://127.0.0.1:{server.server_port}"
+            try:
+                with urlopen(f"{base_url}/api/listings?source=avito", timeout=5) as response:
+                    active = json.load(response)
+                with urlopen(f"{base_url}/api/listings", timeout=5) as response:
+                    catalog = json.load(response)
+                with urlopen(f"{base_url}/api/market?source=avito", timeout=5) as response:
+                    market = json.load(response)
+                with urlopen(f"{base_url}/api/sold?source=drom", timeout=5) as response:
+                    sold = json.load(response)
+                with urlopen(
+                    f"{base_url}/api/listings?visibility=source_hidden",
+                    timeout=5,
+                ) as response:
+                    hidden_by_source = json.load(response)
+                sale_request = Request(
+                    f"{base_url}/api/listings/drom/sold/sale",
+                    data=json.dumps({"sold_price": 470_000}).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="PATCH",
+                )
+                with urlopen(sale_request, timeout=5) as response:
+                    updated = json.load(response)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+        self.assertEqual(active["total"], 1)
+        self.assertEqual(catalog["total"], 1)
+        self.assertEqual(market["price_changes"][0]["delta"], -50_000)
+        self.assertEqual(sold["summary"]["count"], 1)
+        self.assertEqual(sold["items"][0]["sold_price"], 500_000)
+        self.assertEqual(hidden_by_source["total"], 1)
+        self.assertEqual(
+            hidden_by_source["items"][0]["external_id"],
+            "hidden-by-source",
+        )
+        self.assertEqual(updated["sold_price"], 470_000)
+
     def test_client_disconnect_does_not_escape_request_handler(self) -> None:
         handler = object.__new__(ViewerHandler)
         handler.client_address = ("127.0.0.1", 12345)
@@ -423,6 +710,24 @@ class ViewerTests(unittest.TestCase):
                 )
                 with urlopen(create_request, timeout=5) as response:
                     created = json.load(response)
+                all_cars_request = Request(
+                    f"{base_url}/api/search-profiles",
+                    data=json.dumps(
+                        {
+                            "source": "drom",
+                            "all_cars": True,
+                            "region": "moskva",
+                            "radius": 100,
+                            "min_price": 100000,
+                            "max_price": 150000,
+                            "interval_minutes": 30,
+                        }
+                    ).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urlopen(all_cars_request, timeout=5) as response:
+                    all_cars_created = json.load(response)
                 RequestGovernor(database).record_rate_limit(
                     retry_after_seconds=60
                 )
@@ -599,7 +904,20 @@ class ViewerTests(unittest.TestCase):
             )
             self.assertEqual(combined_stats["count"], 1)
             self.assertGreater(created["id"], 0)
+            self.assertGreater(all_cars_created["id"], 0)
             self.assertEqual(profiles["items"][0]["query"], "Volvo XC90")
+            self.assertTrue(
+                any(
+                    item["source"] == "drom"
+                    and item["query"] == "__all_cars__"
+                    and item["region"] == "moskva"
+                    and item["radius"] == 100
+                    and item["min_price"] == 100000
+                    and item["max_price"] == 150000
+                    and item["interval_minutes"] == 30
+                    for item in profiles["items"]
+                )
+            )
             self.assertEqual(
                 profiles["items"][0]["waiting_reason"],
                 "Ожидание снятия ограничения Avito",

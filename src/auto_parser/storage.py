@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
@@ -14,6 +15,18 @@ from auto_parser.images import (
     remap_cached_images,
 )
 from auto_parser.models import Listing
+
+
+def _vehicle_key(value: str | None) -> str:
+    normalized = str(value or "").casefold().replace("ё", "е")
+    normalized = re.sub(r"\bсер(?:ия|ии)\b", "series", normalized)
+    return re.sub(r"[^a-zа-я0-9]+", "", normalized)
+
+
+def _listing_year(listing: Listing) -> int | None:
+    raw = listing.attributes.get("Год выпуска", "")
+    match = re.search(r"\b((?:19|20)\d{2})\b", raw or listing.title)
+    return int(match.group(1)) if match else None
 
 
 class ListingRepository:
@@ -42,6 +55,8 @@ class ListingRepository:
                 location TEXT,
                 published_at TEXT,
                 status TEXT NOT NULL DEFAULT 'active',
+                sold_price INTEGER,
+                sold_at TEXT,
                 hidden INTEGER NOT NULL DEFAULT 0,
                 last_validated_at TEXT,
                 last_detail_attempt_at TEXT,
@@ -55,7 +70,7 @@ class ListingRepository:
                 price INTEGER,
                 currency TEXT,
                 observed_at TEXT NOT NULL,
-                UNIQUE (source, external_id, price, currency)
+                UNIQUE (source, external_id, observed_at)
             );
             CREATE TABLE IF NOT EXISTS listing_images (
                 source TEXT NOT NULL,
@@ -65,12 +80,57 @@ class ListingRepository:
                 cached_at TEXT NOT NULL,
                 PRIMARY KEY (source, external_id, image_url)
             );
+            CREATE TABLE IF NOT EXISTS displayed_listings (
+                client_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                external_id TEXT NOT NULL,
+                seen_at TEXT NOT NULL,
+                PRIMARY KEY (client_id, source, external_id)
+            );
+            CREATE INDEX IF NOT EXISTS displayed_listings_seen_idx
+                ON displayed_listings(seen_at);
+            CREATE INDEX IF NOT EXISTS displayed_listings_listing_idx
+                ON displayed_listings(source, external_id, seen_at);
+            CREATE TABLE IF NOT EXISTS vehicle_trims (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                brand_key TEXT NOT NULL,
+                model_key TEXT NOT NULL,
+                year INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                attributes_json TEXT NOT NULL DEFAULT '{}',
+                source_url TEXT,
+                observed_at TEXT NOT NULL,
+                UNIQUE(brand_key, model_key, year, name)
+            );
+            CREATE INDEX IF NOT EXISTS vehicle_trims_match_idx
+                ON vehicle_trims(brand_key, model_key, year);
+            CREATE TABLE IF NOT EXISTS vehicle_analyses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                brand_key TEXT NOT NULL,
+                model_key TEXT NOT NULL,
+                year INTEGER NOT NULL DEFAULT 0,
+                brand TEXT,
+                model TEXT,
+                analysis_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(brand_key, model_key, year)
+            );
+            CREATE TABLE IF NOT EXISTS listing_vehicle_assessments (
+                source TEXT NOT NULL,
+                external_id TEXT NOT NULL,
+                assessment_json TEXT NOT NULL,
+                description_snapshot TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (source, external_id)
+            );
             CREATE TABLE IF NOT EXISTS search_profiles (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 source TEXT NOT NULL DEFAULT 'avito',
                 query TEXT NOT NULL,
                 region TEXT NOT NULL DEFAULT 'all',
                 radius INTEGER,
+                min_price INTEGER,
+                max_price INTEGER,
                 interval_minutes INTEGER NOT NULL DEFAULT 60,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 last_run_at TEXT,
@@ -78,7 +138,7 @@ class ListingRepository:
                 last_status TEXT,
                 last_result_count INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
-                UNIQUE(source, query, region, radius)
+                UNIQUE(source, query, region, radius, min_price, max_price)
             );
             CREATE TABLE IF NOT EXISTS app_metadata (
                 key TEXT PRIMARY KEY,
@@ -204,7 +264,12 @@ class ListingRepository:
         profile_schema = "".join(
             str(profile_schema_row["sql"] if profile_schema_row else "").split()
         ).lower()
-        if "unique(query,region,radius)" in profile_schema:
+        if (
+            "unique(query,region,radius)" in profile_schema
+            or "unique(source,query,region,radius)" in profile_schema
+            or "min_price" not in profile_columns
+            or "max_price" not in profile_columns
+        ):
             self.connection.executescript(
                 """
                 CREATE TABLE search_profiles_v2 (
@@ -213,6 +278,8 @@ class ListingRepository:
                     query TEXT NOT NULL,
                     region TEXT NOT NULL DEFAULT 'all',
                     radius INTEGER,
+                    min_price INTEGER,
+                    max_price INTEGER,
                     interval_minutes INTEGER NOT NULL DEFAULT 60,
                     enabled INTEGER NOT NULL DEFAULT 1,
                     last_run_at TEXT,
@@ -220,20 +287,52 @@ class ListingRepository:
                     last_status TEXT,
                     last_result_count INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
-                    UNIQUE(source, query, region, radius)
+                    UNIQUE(
+                        source, query, region, radius,
+                        min_price, max_price
+                    )
                 );
                 INSERT INTO search_profiles_v2 (
-                    id, source, query, region, radius, interval_minutes,
+                    id, source, query, region, radius,
+                    min_price, max_price, interval_minutes,
                     enabled, last_run_at, next_run_at, last_status,
                     last_result_count, created_at
                 )
                 SELECT
-                    id, source, query, region, radius, interval_minutes,
+                    id, source, query, region, radius,
+                    NULL, NULL, interval_minutes,
                     enabled, last_run_at, next_run_at, last_status,
                     last_result_count, created_at
                 FROM search_profiles;
                 DROP TABLE search_profiles;
                 ALTER TABLE search_profiles_v2 RENAME TO search_profiles;
+                """
+            )
+        price_schema_row = self.connection.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'price_history'"
+        ).fetchone()
+        price_schema = "".join(
+            str(price_schema_row["sql"] if price_schema_row else "").split()
+        ).lower()
+        if "unique(source,external_id,price,currency)" in price_schema:
+            self.connection.executescript(
+                """
+                CREATE TABLE price_history_v2 (
+                    source TEXT NOT NULL,
+                    external_id TEXT NOT NULL,
+                    price INTEGER,
+                    currency TEXT,
+                    observed_at TEXT NOT NULL,
+                    UNIQUE(source, external_id, observed_at)
+                );
+                INSERT OR IGNORE INTO price_history_v2 (
+                    source, external_id, price, currency, observed_at
+                )
+                SELECT source, external_id, price, currency, observed_at
+                FROM price_history;
+                DROP TABLE price_history;
+                ALTER TABLE price_history_v2 RENAME TO price_history;
                 """
             )
         columns = {
@@ -260,6 +359,10 @@ class ListingRepository:
                 "ALTER TABLE listings ADD COLUMN "
                 "status TEXT NOT NULL DEFAULT 'active'"
             ),
+            "sold_price": (
+                "ALTER TABLE listings ADD COLUMN sold_price INTEGER"
+            ),
+            "sold_at": "ALTER TABLE listings ADD COLUMN sold_at TEXT",
             "hidden": (
                 "ALTER TABLE listings ADD COLUMN "
                 "hidden INTEGER NOT NULL DEFAULT 0"
@@ -274,6 +377,15 @@ class ListingRepository:
         for column, statement in migrations.items():
             if column not in columns:
                 self.connection.execute(statement)
+        self.connection.execute(
+            """
+            UPDATE listings
+            SET status = 'sold',
+                sold_price = COALESCE(sold_price, price),
+                sold_at = COALESCE(sold_at, last_validated_at, last_seen_at)
+            WHERE status = 'inactive'
+            """
+        )
         self.connection.execute(
             "CREATE INDEX IF NOT EXISTS listings_brand_idx ON listings(brand)"
         )
@@ -421,8 +533,8 @@ class ListingRepository:
                     source, external_id, url, title, price, currency, description,
                     mileage_km, brand, model, views_count, attributes_json,
                     location, published_at, status, last_validated_at,
-                    first_seen_at, last_seen_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    sold_price, sold_at, first_seen_at, last_seen_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(source, external_id) DO UPDATE SET
                     url = excluded.url,
                     title = excluded.title,
@@ -449,6 +561,19 @@ class ListingRepository:
                         excluded.published_at, listings.published_at
                     ),
                     status = excluded.status,
+                    sold_price = CASE
+                        WHEN excluded.status = 'sold'
+                        THEN COALESCE(excluded.sold_price, listings.sold_price,
+                                      excluded.price, listings.price)
+                        ELSE NULL
+                    END,
+                    sold_at = CASE
+                        WHEN excluded.status = 'sold'
+                        THEN COALESCE(excluded.sold_at, listings.sold_at,
+                                      excluded.last_validated_at,
+                                      excluded.last_seen_at)
+                        ELSE NULL
+                    END,
                     last_validated_at = COALESCE(
                         excluded.last_validated_at, listings.last_validated_at
                     ),
@@ -471,24 +596,38 @@ class ListingRepository:
                     listing.published_at,
                     listing.status,
                     listing.last_validated_at,
+                    listing.sold_price,
+                    listing.sold_at,
                     listing.collected_at,
                     listing.collected_at,
                 ),
             )
-            self.connection.execute(
+            self._remember_drom_trim(listing)
+            latest_price = self.connection.execute(
                 """
-                INSERT OR IGNORE INTO price_history (
-                    source, external_id, price, currency, observed_at
-                ) VALUES (?, ?, ?, ?, ?)
+                SELECT price, currency FROM price_history
+                WHERE source = ? AND external_id = ?
+                ORDER BY observed_at DESC LIMIT 1
                 """,
-                (
-                    listing.source,
-                    listing.external_id,
-                    listing.price,
-                    listing.currency,
-                    listing.collected_at,
-                ),
-            )
+                (listing.source, listing.external_id),
+            ).fetchone()
+            if latest_price is None or (
+                latest_price["price"], latest_price["currency"]
+            ) != (listing.price, listing.currency):
+                self.connection.execute(
+                    """
+                    INSERT OR IGNORE INTO price_history (
+                        source, external_id, price, currency, observed_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        listing.source,
+                        listing.external_id,
+                        listing.price,
+                        listing.currency,
+                        listing.collected_at,
+                    ),
+                )
             existing_by_identity: dict[str, list[sqlite3.Row]] = {}
             if listing.image_urls:
                 existing_rows = self.connection.execute(
@@ -548,6 +687,191 @@ class ListingRepository:
             count += 1
         self.connection.commit()
         return count
+
+    def _remember_drom_trim(self, listing: Listing) -> None:
+        trim_name = listing.attributes.get("Комплектация", "").strip()
+        year = _listing_year(listing)
+        brand_key = _vehicle_key(listing.brand)
+        model_key = _vehicle_key(listing.model)
+        if (
+            listing.source != "drom"
+            or not trim_name
+            or not brand_key
+            or not model_key
+            or year is None
+        ):
+            return
+        ignored = {"Пробег", "Год выпуска", "Статус на площадке"}
+        attributes = {
+            key: value
+            for key, value in listing.attributes.items()
+            if key not in ignored
+        }
+        self.connection.execute(
+            """
+            INSERT INTO vehicle_trims (
+                brand_key, model_key, year, name, attributes_json,
+                source_url, observed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(brand_key, model_key, year, name) DO UPDATE SET
+                attributes_json = excluded.attributes_json,
+                source_url = excluded.source_url,
+                observed_at = excluded.observed_at
+            """,
+            (
+                brand_key,
+                model_key,
+                year,
+                trim_name,
+                json.dumps(attributes, ensure_ascii=False),
+                listing.url,
+                listing.collected_at,
+            ),
+        )
+
+    def matching_trims(
+        self,
+        brand: str | None,
+        model: str | None,
+        year: int | None,
+    ) -> list[dict[str, Any]]:
+        if not brand or not model or year is None:
+            return []
+        rows = self.connection.execute(
+            """
+            SELECT name, attributes_json, source_url, observed_at
+            FROM vehicle_trims
+            WHERE brand_key = ? AND model_key = ? AND year = ?
+            ORDER BY name COLLATE NOCASE
+            """,
+            (_vehicle_key(brand), _vehicle_key(model), year),
+        ).fetchall()
+        result = []
+        for row in rows:
+            try:
+                attributes = json.loads(row["attributes_json"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                attributes = {}
+            result.append(
+                {
+                    "name": row["name"],
+                    "attributes": attributes,
+                    "source_url": row["source_url"],
+                    "observed_at": row["observed_at"],
+                }
+            )
+        return result
+
+    def vehicle_analysis(
+        self,
+        brand: str | None,
+        model: str | None,
+        year: int | None,
+    ) -> dict[str, Any] | None:
+        if not brand or not model:
+            return None
+        row = self.connection.execute(
+            """
+            SELECT analysis_json, updated_at FROM vehicle_analyses
+            WHERE brand_key = ? AND model_key = ? AND year = ?
+            """,
+            (_vehicle_key(brand), _vehicle_key(model), year or 0),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            analysis = json.loads(row["analysis_json"])
+        except (json.JSONDecodeError, TypeError):
+            return None
+        return {"data": analysis, "updated_at": row["updated_at"]}
+
+    def save_vehicle_analysis(
+        self,
+        brand: str,
+        model: str,
+        year: int | None,
+        analysis: dict[str, Any],
+        *,
+        updated_at: str,
+    ) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO vehicle_analyses (
+                brand_key, model_key, year, brand, model,
+                analysis_json, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(brand_key, model_key, year) DO UPDATE SET
+                brand = excluded.brand,
+                model = excluded.model,
+                analysis_json = excluded.analysis_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                _vehicle_key(brand),
+                _vehicle_key(model),
+                year or 0,
+                brand,
+                model,
+                json.dumps(analysis, ensure_ascii=False),
+                updated_at,
+            ),
+        )
+        self.connection.commit()
+
+    def listing_vehicle_assessment(
+        self,
+        source: str,
+        external_id: str,
+    ) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            """
+            SELECT assessment_json, description_snapshot, updated_at
+            FROM listing_vehicle_assessments
+            WHERE source = ? AND external_id = ?
+            """,
+            (source, external_id),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            assessment = json.loads(row["assessment_json"])
+        except (json.JSONDecodeError, TypeError):
+            return None
+        return {
+            "data": assessment,
+            "description_snapshot": row["description_snapshot"],
+            "updated_at": row["updated_at"],
+        }
+
+    def save_listing_vehicle_assessment(
+        self,
+        source: str,
+        external_id: str,
+        assessment: dict[str, Any],
+        *,
+        description_snapshot: str | None,
+        updated_at: str,
+    ) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO listing_vehicle_assessments (
+                source, external_id, assessment_json,
+                description_snapshot, updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(source, external_id) DO UPDATE SET
+                assessment_json = excluded.assessment_json,
+                description_snapshot = excluded.description_snapshot,
+                updated_at = excluded.updated_at
+            """,
+            (
+                source,
+                external_id,
+                json.dumps(assessment, ensure_ascii=False),
+                description_snapshot,
+                updated_at,
+            ),
+        )
+        self.connection.commit()
 
     def _create_listing_notifications(self, listing: Listing) -> int:
         rules = self.connection.execute(
@@ -742,22 +1066,42 @@ class ListingRepository:
         *,
         due_before: str | None = None,
         limit: int = 100,
+        source: str | None = None,
+        displayed_since: str | None = None,
     ) -> list[Listing]:
-        conditions = ["status = 'active'"]
+        conditions = ["status IN ('active', 'hidden')"]
         values: list[Any] = []
+        if source is not None:
+            conditions.append("source = ?")
+            values.append(source)
         if due_before is not None:
             conditions.append(
                 "(last_validated_at IS NULL OR last_validated_at <= ?)"
             )
             values.append(due_before)
+        displayed_order = (
+            """
+            CASE WHEN EXISTS (
+                SELECT 1 FROM displayed_listings d
+                WHERE d.source = listings.source
+                  AND d.external_id = listings.external_id
+                  AND d.seen_at >= ?
+            ) THEN 0 ELSE 1 END,
+            """
+            if displayed_since is not None
+            else ""
+        )
+        order_values = [displayed_since] if displayed_since is not None else []
         rows = self.connection.execute(
             f"""
             SELECT * FROM listings
             WHERE {" AND ".join(conditions)}
-            ORDER BY COALESCE(last_validated_at, first_seen_at)
+            ORDER BY
+                {displayed_order}
+                COALESCE(last_validated_at, first_seen_at)
             LIMIT ?
             """,
-            (*values, max(1, limit)),
+            (*values, *order_values, max(1, limit)),
         ).fetchall()
         return [self._row_to_listing(row) for row in rows]
 
@@ -868,6 +1212,7 @@ class ListingRepository:
         incomplete_due_before: str,
         stale_due_before: str,
         limit: int = 10,
+        displayed_since: str | None = None,
     ) -> list[Listing]:
         incomplete = """
             description IS NULL
@@ -881,6 +1226,19 @@ class ListingRepository:
                   AND i.image_url LIKE 'https://%'
             )
         """
+        displayed_order = (
+            """
+            CASE WHEN EXISTS (
+                SELECT 1 FROM displayed_listings d
+                WHERE d.source = listings.source
+                  AND d.external_id = listings.external_id
+                  AND d.seen_at >= ?
+            ) THEN 0 ELSE 1 END,
+            """
+            if displayed_since is not None
+            else ""
+        )
+        order_values = [displayed_since] if displayed_since is not None else []
         rows = self.connection.execute(
             f"""
             SELECT source, external_id FROM listings
@@ -895,6 +1253,7 @@ class ListingRepository:
                 OR last_detail_attempt_at <= ?
               )
             ORDER BY
+                {displayed_order}
                 CASE WHEN ({incomplete}) THEN 0 ELSE 1 END,
                 COALESCE(last_detail_attempt_at, first_seen_at)
             LIMIT ?
@@ -903,6 +1262,7 @@ class ListingRepository:
                 source,
                 incomplete_due_before,
                 stale_due_before,
+                *order_values,
                 max(1, limit),
             ),
         ).fetchall()
@@ -912,6 +1272,36 @@ class ListingRepository:
             if listing is not None:
                 listings.append(listing)
         return listings
+
+    def set_displayed_listings(
+        self,
+        client_id: str,
+        listings: list[tuple[str, str]],
+        *,
+        seen_at: str,
+        stale_before: str | None = None,
+    ) -> None:
+        if stale_before is not None:
+            self.connection.execute(
+                "DELETE FROM displayed_listings WHERE seen_at < ?",
+                (stale_before,),
+            )
+        self.connection.execute(
+            "DELETE FROM displayed_listings WHERE client_id = ?",
+            (client_id,),
+        )
+        self.connection.executemany(
+            """
+            INSERT INTO displayed_listings (
+                client_id, source, external_id, seen_at
+            ) VALUES (?, ?, ?, ?)
+            """,
+            [
+                (client_id, source, external_id, seen_at)
+                for source, external_id in listings
+            ],
+        )
+        self.connection.commit()
 
     def mark_detail_attempted(
         self,
@@ -944,18 +1334,40 @@ class ListingRepository:
         self.connection.commit()
         return cursor.rowcount > 0
 
-    def mark_inactive(
+    def mark_sold(
         self, source: str, external_id: str, validated_at: str
     ) -> None:
         self.connection.execute(
             """
             UPDATE listings
-            SET status = 'inactive', last_validated_at = ?, last_seen_at = ?
+            SET status = 'sold', sold_price = COALESCE(sold_price, price),
+                sold_at = COALESCE(sold_at, ?), last_validated_at = ?,
+                last_seen_at = ?
             WHERE source = ? AND external_id = ?
             """,
-            (validated_at, validated_at, source, external_id),
+            (validated_at, validated_at, validated_at, source, external_id),
         )
         self.connection.commit()
+
+    def mark_inactive(
+        self, source: str, external_id: str, validated_at: str
+    ) -> None:
+        self.mark_sold(source, external_id, validated_at)
+
+    def set_sold_price(
+        self, source: str, external_id: str, sold_price: int
+    ) -> bool:
+        cursor = self.connection.execute(
+            """
+            UPDATE listings
+            SET sold_price = ?, status = 'sold',
+                sold_at = COALESCE(sold_at, last_validated_at, last_seen_at)
+            WHERE source = ? AND external_id = ?
+            """,
+            (sold_price, source, external_id),
+        )
+        self.connection.commit()
+        return cursor.rowcount > 0
 
     def search_profiles(self, *, due_before: str | None = None) -> list[sqlite3.Row]:
         if due_before is None:
@@ -979,18 +1391,22 @@ class ListingRepository:
         query: str,
         region: str,
         radius: int | None,
+        min_price: int | None = None,
+        max_price: int | None = None,
         interval_minutes: int,
         created_at: str,
     ) -> int:
         cursor = self.connection.execute(
             """
             INSERT INTO search_profiles (
-                source, query, region, radius, interval_minutes,
+                source, query, region, radius, min_price, max_price,
+                interval_minutes,
                 created_at, next_run_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                source, query, region, radius, interval_minutes,
+                source, query, region, radius, min_price, max_price,
+                interval_minutes,
                 created_at, created_at,
             ),
         )
@@ -1005,6 +1421,8 @@ class ListingRepository:
             "query",
             "region",
             "radius",
+            "min_price",
+            "max_price",
             "interval_minutes",
             "enabled",
             "next_run_at",
@@ -1080,6 +1498,8 @@ class ListingRepository:
             location=row["location"],
             published_at=row["published_at"],
             status=row["status"],
+            sold_price=row["sold_price"],
+            sold_at=row["sold_at"],
             last_validated_at=row["last_validated_at"],
             collected_at=row["last_seen_at"],
         )

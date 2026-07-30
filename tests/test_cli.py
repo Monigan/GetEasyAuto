@@ -11,11 +11,15 @@ class CliTests(unittest.TestCase):
         self.assertTrue(defaults.scheduler)
         self.assertEqual(defaults.images_per_listing, 1)
         self.assertEqual(defaults.search_limit, 200)
-        self.assertEqual(defaults.search_pages, 5)
+        self.assertEqual(defaults.search_pages, 0)
         self.assertEqual(defaults.source, "avito")
         self.assertEqual(
             parser.parse_args(["BMW E39", "--source", "auto_ru"]).source,
             "auto_ru",
+        )
+        self.assertEqual(
+            parser.parse_args(["BMW E39", "--source", "drom"]).source,
+            "drom",
         )
         self.assertFalse(
             parser.parse_args(["--viewer", "--no-scheduler"]).scheduler

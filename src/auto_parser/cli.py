@@ -31,9 +31,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--source",
-        choices=("avito", "auto_ru"),
+        choices=("avito", "auto_ru", "drom"),
         default="avito",
-        help="Источник объявлений: avito или auto_ru",
+        help="Источник объявлений: avito, auto_ru или drom",
     )
     parser.add_argument(
         "--radius",
@@ -42,7 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--url",
-        help="Готовая HTTPS-ссылка поиска Avito или Auto.ru со всеми фильтрами",
+        help="Готовая HTTPS-ссылка поиска Avito, Auto.ru или Drom со всеми фильтрами",
     )
     parser.add_argument(
         "--database",
@@ -69,9 +69,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--search-pages",
-        default=5,
-        type=_positive_int,
-        help="Максимум страниц выдачи проверить (по умолчанию 5)",
+        default=0,
+        type=_non_negative_int,
+        help="Максимум страниц выдачи проверить (по умолчанию 0 — до конца выдачи)",
     )
     parser.add_argument(
         "--debug",

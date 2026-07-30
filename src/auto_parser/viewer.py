@@ -16,7 +16,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Iterator
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote_plus, urlparse
 
 from auto_parser.activity import (
     clear_listing_activity,
@@ -33,7 +33,11 @@ from auto_parser.notification_api import NotificationApiMixin
 from auto_parser.parts_api import PartsApiMixin
 from auto_parser.request_governor import RequestGovernor
 from auto_parser.service import SearchService
-from auto_parser.sources import source_from_name, source_name_from_url
+from auto_parser.sources import (
+    ALL_CARS_QUERY,
+    source_from_name,
+    source_name_from_url,
+)
 from auto_parser.sources.base import SourceError
 from auto_parser.storage import ListingRepository
 
@@ -80,12 +84,17 @@ def _filters(
     query: dict[str, list[str]],
     *,
     apply_visibility: bool = False,
+    default_status: str | None = None,
 ) -> tuple[str, list[Any]]:
     conditions: list[str] = []
     values: list[Any] = []
+    source_hidden = False
     if apply_visibility:
         visibility = query.get("visibility", ["visible"])[0].strip()
-        if visibility == "hidden":
+        if visibility == "source_hidden":
+            conditions.append("l.status = 'hidden'")
+            source_hidden = True
+        elif visibility == "hidden":
             conditions.append("l.hidden = 1")
         elif visibility != "all":
             conditions.append("l.hidden = 0")
@@ -134,6 +143,9 @@ def _filters(
     if status:
         conditions.append("l.status = ?")
         values.append(status)
+    elif default_status and not source_hidden:
+        conditions.append("l.status = ?")
+        values.append(default_status)
 
     for parameter, attribute_name in ATTRIBUTE_FILTERS.items():
         selected = [
@@ -260,7 +272,7 @@ def _row_attributes(row: sqlite3.Row) -> dict[str, str]:
     }
 
 
-def _listing_year(row: sqlite3.Row, attributes: dict[str, str]) -> int | None:
+def _listing_year(row: Any, attributes: dict[str, str]) -> int | None:
     raw = attributes.get("Год выпуска", "")
     match = re.search(r"\b((?:19|20)\d{2})\b", raw)
     if match is None:
@@ -272,6 +284,15 @@ def _listing_year(row: sqlite3.Row, attributes: dict[str, str]) -> int | None:
         return None
     year = int(match.group(1))
     return year if 1950 <= year <= datetime.now().year + 1 else None
+
+
+def _drive2_url(brand: str | None, model: str | None, year: int | None) -> str | None:
+    query = " ".join(
+        filter(None, (brand, model, str(year) if year else None, "бортжурнал"))
+    )
+    if not query:
+        return None
+    return f"https://www.drive2.ru/search/?text={quote_plus(query)}"
 
 
 def _top_distribution(
@@ -307,18 +328,24 @@ class ViewerHandler(
 
     def log_message(self, format: str, *args: object) -> None:
         message = format % args
+        routine_path = self.path.split("?", 1)[0]
         routine_poll = (
-            self.command == "GET"
-            and self.path.split("?", 1)[0]
-            in {
-                "/api/listings",
-                "/api/refresh-activity",
-                "/api/stats",
-                "/api/search-profiles",
-                "/api/notifications",
-            }
-            and " 200 " in f" {message} "
-        )
+            (
+                self.command == "GET"
+                and routine_path
+                in {
+                    "/api/listings",
+                    "/api/refresh-activity",
+                    "/api/stats",
+                    "/api/search-profiles",
+                    "/api/notifications",
+                }
+            )
+            or (
+                self.command == "POST"
+                and routine_path == "/api/displayed-listings"
+            )
+        ) and " 200 " in f" {message} "
         if routine_poll:
             logging.getLogger(__name__).debug(
                 "[viewer] %s - %s",
@@ -336,6 +363,8 @@ class ViewerHandler(
             return
         if parsed.path == "/api/listings":
             self._listings(parse_qs(parsed.query))
+        elif parsed.path == "/api/sold":
+            self._sold(parse_qs(parsed.query))
         elif parsed.path == "/api/refresh-activity":
             self._refresh_activity()
         elif parsed.path == "/api/stats":
@@ -365,6 +394,12 @@ class ViewerHandler(
             return
         if parsed.path == "/api/search-profiles":
             self._create_search_profile()
+            return
+        if parsed.path == "/api/vehicle-analysis":
+            self._save_vehicle_analysis()
+            return
+        if parsed.path == "/api/displayed-listings":
+            self._set_displayed_listings()
             return
         if parsed.path == "/api/parts":
             self._create_part()
@@ -405,6 +440,13 @@ class ViewerHandler(
             and parts[4] == "visibility"
         ):
             self._set_listing_visibility(parts[2], parts[3])
+            return
+        if (
+            len(parts) == 5
+            and parts[:2] == ["api", "listings"]
+            and parts[4] == "sale"
+        ):
+            self._set_listing_sale(parts[2], parts[3])
             return
         if len(parts) == 3 and parts[:2] == ["api", "search-profiles"]:
             self._update_search_profile(_integer(parts[2]))
@@ -462,7 +504,11 @@ class ViewerHandler(
         self.wfile.write(body)
 
     def _listings(self, query: dict[str, list[str]]) -> None:
-        where, values = _filters(query, apply_visibility=True)
+        where, values = _filters(
+            query,
+            apply_visibility=True,
+            default_status="active",
+        )
         page = _integer(query.get("page", ["1"])[0], minimum=1) or 1
         page_size = min(
             _integer(query.get("page_size", ["24"])[0], minimum=1) or 24,
@@ -500,36 +546,80 @@ class ViewerHandler(
                 [*values, page_size, (page - 1) * page_size],
             ).fetchall()
         items = []
-        for row in rows:
-            item = dict(row)
-            try:
-                item["attributes"] = json.loads(
-                    item.pop("attributes_json") or "{}"
+        with ListingRepository(self.database) as repository:
+            for row in rows:
+                item = dict(row)
+                try:
+                    item["attributes"] = json.loads(
+                        item.pop("attributes_json") or "{}"
+                    )
+                except (json.JSONDecodeError, TypeError):
+                    item["attributes"] = {}
+                year = _listing_year(item, item["attributes"])
+                item["year"] = year
+                item["published_at_inferred"] = not bool(item["published_at"])
+                item["published_at"] = (
+                    item["published_at"] or item["first_seen_at"]
                 )
-            except (json.JSONDecodeError, TypeError):
-                item["attributes"] = {}
-            item["thumbnail_url"] = (
-                f"/media/{item['source']}/{item['external_id']}/0"
-                if item["image_count"]
-                else None
-            )
-            item["image_pending"] = (
-                item["image_source_count"] > item["image_count"]
-            )
-            item["images"] = [
-                f"/media/{item['source']}/{item['external_id']}/{index}"
-                for index in range(item["image_count"])
-            ]
-            activity = listing_activity(
-                item["source"],
-                item["external_id"],
-            )
-            item["update_stage"] = activity.stage if activity else None
-            item["update_priority"] = (
-                activity.priority if activity else None
-            )
-            item["update_state"] = activity.state if activity else None
-            items.append(item)
+                exact_trim = item["attributes"].get("Комплектация")
+                item["trim_exact"] = bool(exact_trim)
+                item["trim_options"] = (
+                    [
+                        {
+                            "name": exact_trim,
+                            "attributes": item["attributes"],
+                            "source_url": (
+                                item["url"]
+                                if item["source"] == "drom"
+                                else None
+                            ),
+                        }
+                    ]
+                    if exact_trim
+                    else repository.matching_trims(
+                        item["brand"],
+                        item["model"],
+                        year,
+                    )
+                )
+                item["drive2_url"] = _drive2_url(
+                    item["brand"],
+                    item["model"],
+                    year,
+                )
+                item["vehicle_analysis"] = repository.vehicle_analysis(
+                    item["brand"],
+                    item["model"],
+                    year,
+                )
+                item["listing_assessment"] = (
+                    repository.listing_vehicle_assessment(
+                        item["source"],
+                        item["external_id"],
+                    )
+                )
+                item["thumbnail_url"] = (
+                    f"/media/{item['source']}/{item['external_id']}/0"
+                    if item["image_count"]
+                    else None
+                )
+                item["image_pending"] = (
+                    item["image_source_count"] > item["image_count"]
+                )
+                item["images"] = [
+                    f"/media/{item['source']}/{item['external_id']}/{index}"
+                    for index in range(item["image_count"])
+                ]
+                activity = listing_activity(
+                    item["source"],
+                    item["external_id"],
+                )
+                item["update_stage"] = activity.stage if activity else None
+                item["update_priority"] = (
+                    activity.priority if activity else None
+                )
+                item["update_state"] = activity.state if activity else None
+                items.append(item)
         self._json(
             {
                 "items": items,
@@ -569,11 +659,14 @@ class ViewerHandler(
                         "source": source,
                         "external_id": external_id,
                         "title": (
-                            _repair_legacy_text(row["title"])
-                            if row
-                            else external_id
+                            activity.title
+                            or (
+                                _repair_legacy_text(row["title"])
+                                if row
+                                else external_id
+                            )
                         ),
-                        "url": row["url"] if row else None,
+                        "url": activity.url or (row["url"] if row else None),
                         "stage": activity.stage,
                         "priority": activity.priority,
                         "state": activity.state,
@@ -599,8 +692,123 @@ class ViewerHandler(
             }
         )
 
+    def _set_displayed_listings(self) -> None:
+        payload = self._read_json()
+        if payload is None:
+            return
+        client_id = str(payload.get("client_id") or "").strip()
+        raw_items = payload.get("items")
+        if (
+            not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", client_id)
+            or not isinstance(raw_items, list)
+            or len(raw_items) > 100
+        ):
+            self.send_error(HTTPStatus.BAD_REQUEST)
+            return
+        listings: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for raw_item in raw_items:
+            if not isinstance(raw_item, dict):
+                self.send_error(HTTPStatus.BAD_REQUEST)
+                return
+            source = str(raw_item.get("source") or "").strip().lower()
+            external_id = str(
+                raw_item.get("external_id") or ""
+            ).strip()
+            key = (source, external_id)
+            if (
+                source not in {"avito", "auto_ru", "drom"}
+                or not external_id
+                or len(external_id) > 200
+            ):
+                self.send_error(HTTPStatus.BAD_REQUEST)
+                return
+            if key not in seen:
+                seen.add(key)
+                listings.append(key)
+        with ListingRepository(self.database) as repository:
+            now = datetime.now(timezone.utc)
+            repository.set_displayed_listings(
+                client_id,
+                listings,
+                seen_at=now.isoformat(),
+                stale_before=(now - timedelta(days=1)).isoformat(),
+            )
+        self._json({"tracked": len(listings)})
+
+    def _save_vehicle_analysis(self) -> None:
+        payload = self._read_json()
+        if payload is None:
+            return
+        source = str(payload.get("source") or "").strip().lower()
+        external_id = str(payload.get("external_id") or "").strip()
+        analysis = payload.get("analysis")
+        if (
+            source not in {"avito", "auto_ru", "drom"}
+            or not external_id
+            or not isinstance(analysis, dict)
+        ):
+            self._json(
+                {"error": "Ожидались объявление и JSON-объект анализа"},
+                HTTPStatus.BAD_REQUEST,
+            )
+            return
+        with ListingRepository(self.database) as repository:
+            listing = repository.get_listing(source, external_id)
+            if listing is None:
+                self._json(
+                    {"error": "Объявление не найдено"},
+                    HTTPStatus.NOT_FOUND,
+                )
+                return
+            year = _listing_year(
+                {"title": listing.title},
+                listing.attributes,
+            )
+            if not listing.brand or not listing.model:
+                self._json(
+                    {"error": "Не удалось определить марку и модель"},
+                    HTTPStatus.BAD_REQUEST,
+                )
+                return
+            model_analysis = analysis.get("model_analysis")
+            listing_assessment = analysis.get("listing_assessment")
+            if not isinstance(model_analysis, dict):
+                model_analysis = analysis
+            repository.save_vehicle_analysis(
+                listing.brand,
+                listing.model,
+                year,
+                model_analysis,
+                updated_at=utc_now_iso(),
+            )
+            if isinstance(listing_assessment, dict):
+                repository.save_listing_vehicle_assessment(
+                    source,
+                    external_id,
+                    listing_assessment,
+                    description_snapshot=listing.description,
+                    updated_at=utc_now_iso(),
+                )
+            saved = repository.vehicle_analysis(
+                listing.brand,
+                listing.model,
+                year,
+            )
+            saved_assessment = repository.listing_vehicle_assessment(
+                source,
+                external_id,
+            )
+        self._json(
+            {
+                "saved": True,
+                "vehicle_analysis": saved,
+                "listing_assessment": saved_assessment,
+            }
+        )
+
     def _stats(self, query: dict[str, list[str]]) -> None:
-        where, values = _filters(query)
+        where, values = _filters(query, default_status="active")
         with _open_database(self.database) as connection:
             rows = connection.execute(
                 f"""
@@ -689,7 +897,13 @@ class ViewerHandler(
         )
 
     def _market(self, query: dict[str, list[str]]) -> None:
-        where, values = _filters(query)
+        where, values = _filters(query, default_status="active")
+        sold_query = dict(query)
+        sold_query.pop("status", None)
+        sold_where, sold_values = _filters(
+            sold_query,
+            default_status="sold",
+        )
         with _open_database(self.database) as connection:
             rows = connection.execute(
                 f"""
@@ -711,6 +925,10 @@ class ViewerHandler(
                 WHERE price IS NOT NULL
                 ORDER BY source, external_id, observed_at DESC
                 """
+            ).fetchall()
+            sold_rows = connection.execute(
+                f"SELECT l.* FROM listings l{sold_where}",
+                sold_values,
             ).fetchall()
 
         selected_ids = {(row["source"], row["external_id"]) for row in rows}
@@ -762,14 +980,57 @@ class ViewerHandler(
 
         reductions = []
         increases = []
+        price_changes = []
         for key, price_records in grouped_history.items():
             if len(price_records) < 2:
                 continue
             delta = price_records[0]["price"] - price_records[1]["price"]
+            row = next(
+                record["row"] for record in records
+                if (record["row"]["source"], record["row"]["external_id"])
+                == key
+            )
+            previous = price_records[1]["price"]
+            price_changes.append(
+                {
+                    "source": key[0],
+                    "external_id": key[1],
+                    "title": _repair_legacy_text(row["title"]),
+                    "url": row["url"],
+                    "previous": previous,
+                    "current": price_records[0]["price"],
+                    "delta": delta,
+                    "delta_percent": (
+                        round(delta / previous * 100, 1) if previous else None
+                    ),
+                    "observed_at": price_records[0]["observed_at"],
+                }
+            )
             if delta < 0:
                 reductions.append(delta)
             elif delta > 0:
                 increases.append(delta)
+        price_changes.sort(key=lambda item: item["observed_at"], reverse=True)
+
+        sold_prices = [
+            row["sold_price"] or row["price"]
+            for row in sold_rows
+            if (row["sold_price"] or row["price"]) is not None
+        ]
+        sold_days = []
+        for row in sold_rows:
+            try:
+                started = datetime.fromisoformat(
+                    row["first_seen_at"].replace("Z", "+00:00")
+                )
+                finished = datetime.fromisoformat(
+                    (row["sold_at"] or row["last_seen_at"]).replace(
+                        "Z", "+00:00"
+                    )
+                )
+                sold_days.append(max(0, (finished - started).days))
+            except (AttributeError, TypeError, ValueError):
+                pass
 
         now = datetime.now(timezone.utc)
 
@@ -1092,6 +1353,22 @@ class ViewerHandler(
                     }
                     for day in sorted(history_by_day)
                 ],
+                "price_changes": price_changes[:50],
+                "sold_summary": {
+                    "count": len(sold_rows),
+                    "median_price": (
+                        round(statistics.median(sold_prices))
+                        if sold_prices else None
+                    ),
+                    "average_price": (
+                        round(statistics.fmean(sold_prices))
+                        if sold_prices else None
+                    ),
+                    "median_days_on_market": (
+                        round(statistics.median(sold_days))
+                        if sold_days else None
+                    ),
+                },
                 "price_histogram": _histogram(
                     prices,
                     [500_000, 1_000_000, 2_000_000, 3_000_000, 5_000_000],
@@ -1117,6 +1394,62 @@ class ViewerHandler(
                     ],
                 ),
                 "deals": deals[:10],
+            }
+        )
+
+    def _sold(self, query: dict[str, list[str]]) -> None:
+        sold_query = dict(query)
+        sold_query.pop("status", None)
+        where, values = _filters(sold_query, default_status="sold")
+        with _open_database(self.database) as connection:
+            rows = connection.execute(
+                f"""
+                SELECT l.* FROM listings l{where}
+                ORDER BY COALESCE(l.sold_at, l.last_seen_at) DESC
+                """,
+                values,
+            ).fetchall()
+        items = []
+        days = []
+        for row in rows:
+            item = dict(row)
+            item["sold_price"] = item["sold_price"] or item["price"]
+            try:
+                started = datetime.fromisoformat(
+                    item["first_seen_at"].replace("Z", "+00:00")
+                )
+                finished = datetime.fromisoformat(
+                    (item["sold_at"] or item["last_seen_at"]).replace(
+                        "Z", "+00:00"
+                    )
+                )
+                item["days_on_market"] = max(0, (finished - started).days)
+                days.append(item["days_on_market"])
+            except (AttributeError, TypeError, ValueError):
+                item["days_on_market"] = None
+            item.pop("attributes_json", None)
+            items.append(item)
+        prices = [item["sold_price"] for item in items if item["sold_price"]]
+        source_counts = Counter(item["source"] for item in items)
+        self._json(
+            {
+                "items": items,
+                "summary": {
+                    "count": len(items),
+                    "median_price": (
+                        round(statistics.median(prices)) if prices else None
+                    ),
+                    "average_price": (
+                        round(statistics.fmean(prices)) if prices else None
+                    ),
+                    "median_days_on_market": (
+                        round(statistics.median(days)) if days else None
+                    ),
+                    "sources": [
+                        {"label": source, "value": count}
+                        for source, count in source_counts.most_common()
+                    ],
+                },
             }
         )
 
@@ -1290,6 +1623,12 @@ class ViewerHandler(
                     """
                 )
             ]
+            sources = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT DISTINCT source FROM listings ORDER BY source"
+                )
+            ]
             attribute_rows = connection.execute(
                 """
                 SELECT attributes_json FROM listings
@@ -1331,6 +1670,7 @@ class ViewerHandler(
             {
                 "locations": locations,
                 "brands": brands,
+                "sources": sources,
                 "attribute_options": {
                     parameter: sorted(
                         options,
@@ -1389,14 +1729,56 @@ class ViewerHandler(
         payload = self._read_json()
         if payload is None:
             return
-        query = str(payload.get("query", "")).strip()
+        all_cars = payload.get("all_cars") is True
+        query = (
+            ALL_CARS_QUERY
+            if all_cars
+            else str(payload.get("query", "")).strip()
+        )
         source_name = str(payload.get("source", "avito")).strip().lower()
         region = str(payload.get("region", "all")).strip().lower()
         radius = _integer(str(payload.get("radius", "")))
+        min_price = _integer(str(payload.get("min_price", "")))
+        max_price = _integer(str(payload.get("max_price", "")))
         interval = _integer(str(payload.get("interval_minutes", "60")), minimum=15)
         if not query or not region or interval is None:
             self.send_error(HTTPStatus.BAD_REQUEST)
             return
+        if source_name not in {"avito", "auto_ru", "drom"}:
+            self._json(
+                {"error": "Источник объявлений не поддерживается"},
+                HTTPStatus.BAD_REQUEST,
+            )
+            return
+        if (
+            min_price is not None
+            and max_price is not None
+            and min_price > max_price
+        ):
+            self._json(
+                {
+                    "error": (
+                        "Минимальная цена не может быть больше максимальной"
+                    )
+                },
+                HTTPStatus.BAD_REQUEST,
+            )
+            return
+        if all_cars:
+            try:
+                source_from_name(
+                    source_name,
+                    region=region,
+                    radius=radius,
+                    min_price=min_price,
+                    max_price=max_price,
+                ).build_search_url("")
+            except ValueError as error:
+                self._json(
+                    {"error": str(error)},
+                    HTTPStatus.BAD_REQUEST,
+                )
+                return
         if query.startswith(("https://", "http://")):
             try:
                 source_name = source_name_from_url(query)
@@ -1404,6 +1786,8 @@ class ViewerHandler(
                     source_name,
                     region=region,
                     radius=radius,
+                    min_price=min_price,
+                    max_price=max_price,
                     search_url=query,
                 ).build_search_url("")
             except ValueError as error:
@@ -1419,6 +1803,8 @@ class ViewerHandler(
                     query=query,
                     region=region,
                     radius=radius,
+                    min_price=min_price,
+                    max_price=max_price,
                     interval_minutes=interval,
                     created_at=utc_now_iso(),
                 )
@@ -1443,6 +1829,23 @@ class ViewerHandler(
             )
         if "enabled" in payload:
             payload["enabled"] = 1 if payload["enabled"] else 0
+        for field in ("min_price", "max_price"):
+            if field in payload:
+                payload[field] = _integer(str(payload[field]))
+        if (
+            payload.get("min_price") is not None
+            and payload.get("max_price") is not None
+            and payload["min_price"] > payload["max_price"]
+        ):
+            self._json(
+                {
+                    "error": (
+                        "Минимальная цена не может быть больше максимальной"
+                    )
+                },
+                HTTPStatus.BAD_REQUEST,
+            )
+            return
         with ListingRepository(self.database) as repository:
             updated = repository.update_search_profile(profile_id, payload)
         self._json({"updated": updated})
@@ -1483,6 +1886,33 @@ class ViewerHandler(
             return
         self._json({"updated": True, "hidden": payload["hidden"]})
 
+    def _set_listing_sale(
+        self,
+        source_name: str,
+        external_id: str,
+    ) -> None:
+        payload = self._read_json()
+        sold_price = _integer(str(payload.get("sold_price", ""))) if payload else None
+        if sold_price is None:
+            self._json(
+                {"error": "Укажите цену продажи"},
+                HTTPStatus.BAD_REQUEST,
+            )
+            return
+        with ListingRepository(self.database) as repository:
+            updated = repository.set_sold_price(
+                source_name,
+                external_id,
+                sold_price,
+            )
+        if not updated:
+            self._json(
+                {"error": "Объявление не найдено"},
+                HTTPStatus.NOT_FOUND,
+            )
+            return
+        self._json({"updated": True, "sold_price": sold_price})
+
     def _cache_listing_gallery(
         self,
         source_name: str,
@@ -1490,7 +1920,7 @@ class ViewerHandler(
         *,
         prepare: bool = False,
     ) -> None:
-        if source_name not in {"avito", "auto_ru"} or not external_id:
+        if source_name not in {"avito", "auto_ru", "drom"} or not external_id:
             self._json(
                 {"error": "Источник объявления не поддерживается"},
                 HTTPStatus.BAD_REQUEST,
@@ -1575,6 +2005,56 @@ class ViewerHandler(
                 if gallery_refreshed:
                     repository.replace_listing_images(listing)
                 refreshed = repository.get_listing(source_name, external_id)
+                stored_row = repository.connection.execute(
+                    """
+                    SELECT first_seen_at FROM listings
+                    WHERE source = ? AND external_id = ?
+                    """,
+                    (source_name, external_id),
+                ).fetchone()
+                refreshed_year = (
+                    _listing_year(
+                        {"title": refreshed.title},
+                        refreshed.attributes,
+                    )
+                    if refreshed
+                    else None
+                )
+                exact_trim = (
+                    refreshed.attributes.get("Комплектация")
+                    if refreshed
+                    else None
+                )
+                trim_options = (
+                    [
+                        {
+                            "name": exact_trim,
+                            "attributes": refreshed.attributes,
+                            "source_url": (
+                                refreshed.url
+                                if refreshed.source == "drom"
+                                else None
+                            ),
+                        }
+                    ]
+                    if exact_trim and refreshed
+                    else repository.matching_trims(
+                        refreshed.brand if refreshed else None,
+                        refreshed.model if refreshed else None,
+                        refreshed_year,
+                    )
+                )
+                vehicle_analysis = repository.vehicle_analysis(
+                    refreshed.brand if refreshed else None,
+                    refreshed.model if refreshed else None,
+                    refreshed_year,
+                )
+                listing_assessment = (
+                    repository.listing_vehicle_assessment(
+                        source_name,
+                        external_id,
+                    )
+                )
         except OSError as error:
             if activity_started:
                 clear_listing_activity(
@@ -1622,8 +2102,27 @@ class ViewerHandler(
                 "description": refreshed.description if refreshed else None,
                 "mileage_km": refreshed.mileage_km if refreshed else None,
                 "views_count": refreshed.views_count if refreshed else None,
-                "published_at": refreshed.published_at if refreshed else None,
+                "published_at": (
+                    refreshed.published_at
+                    if refreshed and refreshed.published_at
+                    else stored_row["first_seen_at"] if stored_row else None
+                ),
+                "published_at_inferred": bool(
+                    refreshed
+                    and not refreshed.published_at
+                    and stored_row
+                ),
                 "attributes": refreshed.attributes if refreshed else {},
+                "year": refreshed_year,
+                "trim_exact": bool(exact_trim),
+                "trim_options": trim_options,
+                "drive2_url": _drive2_url(
+                    refreshed.brand if refreshed else None,
+                    refreshed.model if refreshed else None,
+                    refreshed_year,
+                ),
+                "vehicle_analysis": vehicle_analysis,
+                "listing_assessment": listing_assessment,
                 "warning": warning,
             }
         )

@@ -46,6 +46,29 @@ DETAIL_HTML = """
 
 
 class AutoRuSourceTests(unittest.TestCase):
+    def test_builds_url_with_price_range(self) -> None:
+        self.assertEqual(
+            AutoRuSource(
+                region="tver",
+                min_price=100_000,
+                max_price=150_000,
+            ).build_search_url(""),
+            (
+                "https://auto.ru/tver/cars/all/"
+                "?price_from=100000&price_to=150000"
+            ),
+        )
+
+    def test_builds_all_cars_urls(self) -> None:
+        self.assertEqual(
+            AutoRuSource(region="tver").build_search_url(""),
+            "https://auto.ru/tver/cars/all/",
+        )
+        self.assertEqual(
+            AutoRuSource(region="all").build_search_url(""),
+            "https://auto.ru/cars/all/",
+        )
+
     def test_builds_search_url_and_preserves_catalog_filters(self) -> None:
         source = AutoRuSource(region="tver")
         self.assertEqual(

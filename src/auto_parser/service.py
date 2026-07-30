@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import logging
 import hashlib
+import itertools
+import logging
 import threading
 import time
 from dataclasses import dataclass, field
@@ -9,6 +10,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from http.cookiejar import CookieJar
 from pathlib import Path
+from typing import Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from urllib.request import HTTPCookieProcessor, OpenerDirector, Request, build_opener
@@ -38,7 +40,7 @@ IMAGE_EXTENSIONS = {
 }
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 DEFAULT_SEARCH_LIMIT = 200
-DEFAULT_SEARCH_PAGES = 5
+DEFAULT_SEARCH_PAGES = 0
 _IMAGE_CACHE_LOCKS: dict[str, threading.Lock] = {}
 _IMAGE_CACHE_LOCKS_GUARD = threading.Lock()
 
@@ -72,20 +74,22 @@ class SearchService:
         query: str,
         *,
         max_results: int = DEFAULT_SEARCH_LIMIT,
-        max_pages: int = DEFAULT_SEARCH_PAGES,
+        max_pages: int | None = DEFAULT_SEARCH_PAGES,
+        on_page: Callable[[list[Listing], int, int], None] | None = None,
     ) -> list[Listing]:
-        if max_results < 1 or max_pages < 1:
+        if max_results < 1 or (max_pages is not None and max_pages < 0):
             raise ValueError(
-                "Лимит объявлений и число страниц должны быть больше нуля"
+                "Лимит объявлений должен быть больше нуля, а число страниц — неотрицательным"
             )
+        page_limit = max_pages or None
         self.rate_limit_error = None
         urls = self.source.build_search_urls(query)
         logger.info(
-            "Источник=%s, вариантов URL=%d, максимум объявлений=%d, страниц=%d",
+            "Источник=%s, вариантов URL=%d, максимум объявлений=%d, страниц=%s",
             self.source.name,
             len(urls),
             max_results,
-            max_pages,
+            page_limit or "все",
         )
 
         for attempt, url in enumerate(urls, start=1):
@@ -96,14 +100,19 @@ class SearchService:
                 _url_for_log(url),
             )
             listings: dict[str, Listing] = {}
-            for page in range(1, max_pages + 1):
+            pages = (
+                range(1, page_limit + 1)
+                if page_limit is not None
+                else itertools.count(1)
+            )
+            for page in pages:
                 page_url = self.source.build_page_url(url, page)
                 if page_url is None:
                     break
                 logger.info(
-                    "Страница выдачи %d/%d: %s",
+                    "Страница выдачи %d/%s: %s",
                     page,
-                    max_pages,
+                    page_limit or "все",
                     _url_for_log(page_url),
                 )
                 try:
@@ -126,10 +135,15 @@ class SearchService:
                     )
                     break
                 previous_count = len(listings)
+                new_listings: list[Listing] = []
                 for listing in page_listings:
+                    if listing.external_id not in listings:
+                        new_listings.append(listing)
                     listings[listing.external_id] = listing
                     if len(listings) >= max_results:
                         break
+                if on_page is not None and new_listings:
+                    on_page(new_listings, page, len(listings))
                 logger.info(
                     "Страница %d: получено=%d, новых=%d, всего=%d",
                     page,
@@ -215,12 +229,27 @@ class SearchService:
                 request_kind="validation",
             )
             self.source.enrich_listing(listing, html)
+            if listing.status in {"inactive", "sold"}:
+                listing.status = "sold"
+                listing.sold_price = listing.sold_price or listing.price
+                listing.sold_at = listing.sold_at or utc_now_iso()
+                listing.last_validated_at = listing.sold_at
+                return "sold"
+            if listing.status == "hidden":
+                listing.sold_price = None
+                listing.sold_at = None
+                listing.last_validated_at = (
+                    listing.last_validated_at or utc_now_iso()
+                )
+                return "hidden"
             return "active"
         except HttpSourceError as error:
             if error.status_code in {404, 410}:
-                listing.status = "inactive"
+                listing.status = "sold"
+                listing.sold_price = listing.price
+                listing.sold_at = utc_now_iso()
                 listing.last_validated_at = utc_now_iso()
-                return "inactive"
+                return "sold"
             raise
 
     def cache_images(

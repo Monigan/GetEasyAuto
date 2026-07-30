@@ -9,6 +9,25 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 
 class AvitoSourceTests(unittest.TestCase):
+    def test_builds_url_with_price_range(self) -> None:
+        url = AvitoSource(
+            region="tver",
+            min_price=100_000,
+            max_price=150_000,
+        ).build_search_url("")
+
+        self.assertIn("pmin=100000", url)
+        self.assertIn("pmax=150000", url)
+
+    def test_builds_all_cars_url_with_region_and_radius(self) -> None:
+        url = AvitoSource(region="tver", radius=150).build_search_url("")
+
+        self.assertEqual(
+            url,
+            "https://www.avito.ru/tver/avtomobili"
+            "?cd=1&localPriority=0&radius=150&searchRadius=150",
+        )
+
     def test_build_search_url(self) -> None:
         url = AvitoSource().build_search_url("  Toyota   Camry ")
         self.assertEqual(
@@ -205,9 +224,70 @@ class AvitoSourceTests(unittest.TestCase):
         self.assertEqual(listing.attributes["Цвет"], "Чёрный")
         self.assertEqual(listing.attributes["Мощность"], "192 л.с.")
 
-    def test_rejects_empty_query(self) -> None:
-        with self.assertRaisesRegex(ValueError, "пустым"):
-            AvitoSource().build_search_url(" ")
+    def test_detects_sold_listing_from_avito_state(self) -> None:
+        listing = AvitoSource().parse_search_page(
+            """
+            <div data-marker="item">
+              <a data-marker="item-title"
+                 href="/klin/avtomobili/bmw_1997_8051475686">
+                BMW 5 серия, 1997
+              </a>
+            </div>
+            """
+        )[0]
+        detail_html = """
+        <html><body>
+          <script>
+            window.__staticRouterHydrationData = {
+              "loaderData": {"item": {"id": 8051475686, "isItemSold": true}}
+            };
+          </script>
+          <div data-marker="item-view/item-status">Автомобиль продан</div>
+        </body></html>
+        """
+
+        AvitoSource().enrich_listing(listing, detail_html)
+
+        self.assertEqual(listing.status, "sold")
+        self.assertEqual(listing.attributes["Статус на площадке"], "Продано")
+        self.assertIsNotNone(listing.sold_at)
+
+    def test_detects_listing_hidden_by_avito(self) -> None:
+        listing = AvitoSource().parse_search_page(
+            """
+            <div data-marker="item">
+              <a data-marker="item-title"
+                 href="/pushkino/avtomobili/bmw_1997_8199311527">
+                BMW 5 серия, 1997
+              </a>
+            </div>
+            """
+        )[0]
+        detail_html = """
+        <html><body>
+          <script>
+            window.__staticRouterHydrationData = {
+              "loaderData": {
+                "item": {"id": 8199311527, "itemStatus": "hidden"}
+              }
+            };
+          </script>
+          <div data-marker="item-view/item-status">Объявление скрыто</div>
+        </body></html>
+        """
+
+        AvitoSource().enrich_listing(listing, detail_html)
+
+        self.assertEqual(listing.status, "hidden")
+        self.assertEqual(listing.attributes["Статус на площадке"], "Скрыто")
+        self.assertIsNone(listing.sold_price)
+        self.assertIsNone(listing.sold_at)
+
+    def test_empty_query_builds_all_russia_catalog(self) -> None:
+        self.assertEqual(
+            AvitoSource().build_search_url(" "),
+            "https://www.avito.ru/all/avtomobili?cd=1",
+        )
 
 
 if __name__ == "__main__":

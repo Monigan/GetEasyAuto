@@ -9,6 +9,9 @@ _AVITO_LEGACY_QUALITY_PATTERN = re.compile(
     r"^/image/1/1\.[^./?]{6}a(\d)"
 )
 _AUTO_RU_SIZE_PATTERN = re.compile(r"/(\d+)x(\d+)$")
+_DROM_HOST_PATTERN = re.compile(r"^s\d*\.auto\.drom\.ru$")
+_DROM_PHOTO_PATTERN = re.compile(r"^/photo/v\d+/([^/]+)/")
+_DROM_SIZE_PATTERN = re.compile(r"/gen(\d+)(x2)?(?:[^/]*)\.[a-z0-9]+$", re.I)
 
 
 def is_avito_image_url(url: str) -> bool:
@@ -48,6 +51,16 @@ def is_auto_ru_image_url(url: str) -> bool:
     )
 
 
+def is_drom_image_url(url: str) -> bool:
+    parsed = urlsplit(url)
+    hostname = (parsed.hostname or "").lower()
+    return (
+        parsed.scheme == "https"
+        and _DROM_HOST_PATTERN.fullmatch(hostname) is not None
+        and parsed.path.startswith("/photo/")
+    )
+
+
 def image_identity(url: str) -> str:
     if is_avito_image_url(url):
         return avito_image_identity(url)
@@ -55,11 +68,19 @@ def image_identity(url: str) -> str:
     if is_auto_ru_image_url(url):
         path = _AUTO_RU_SIZE_PATTERN.sub("", parsed.path)
         return f"auto_ru:{parsed.netloc.lower()}{path}"
+    if is_drom_image_url(url):
+        match = _DROM_PHOTO_PATTERN.match(parsed.path)
+        if match:
+            return f"drom:{match.group(1)}"
     return urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path, "", ""))
 
 
 def is_supported_image_url(url: str) -> bool:
-    return is_avito_image_url(url) or is_auto_ru_image_url(url)
+    return (
+        is_avito_image_url(url)
+        or is_auto_ru_image_url(url)
+        or is_drom_image_url(url)
+    )
 
 
 def _quality_rank(url: str) -> int:
@@ -91,6 +112,11 @@ def deduplicate_avito_image_urls(urls: list[str]) -> list[str]:
 def _generic_quality_rank(url: str) -> int:
     if is_avito_image_url(url):
         return _quality_rank(url)
+    if is_drom_image_url(url):
+        match = _DROM_SIZE_PATTERN.search(urlsplit(url).path)
+        if match:
+            return int(match.group(1)) * (2 if match.group(2) else 1)
+        return 1
     match = _AUTO_RU_SIZE_PATTERN.search(urlsplit(url).path)
     return int(match.group(1)) * int(match.group(2)) if match else 0
 

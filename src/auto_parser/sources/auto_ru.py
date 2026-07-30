@@ -200,28 +200,90 @@ class _DetailParser(HTMLParser):
         self.depth -= 1
 
 
+def _validate_price_range(
+    min_price: int | None,
+    max_price: int | None,
+) -> None:
+    if min_price is not None and min_price < 0:
+        raise ValueError("Минимальная цена не может быть отрицательной")
+    if max_price is not None and max_price < 0:
+        raise ValueError("Максимальная цена не может быть отрицательной")
+    if (
+        min_price is not None
+        and max_price is not None
+        and min_price > max_price
+    ):
+        raise ValueError("Минимальная цена не может быть больше максимальной")
+
+
 class AutoRuSource(Source):
     name = "auto_ru"
     base_url = "https://auto.ru"
 
-    def __init__(self, *, region: str = "all", radius: int | None = None, search_url: str | None = None) -> None:
+    def __init__(self, *, region: str = "all", radius: int | None = None, min_price: int | None = None, max_price: int | None = None, search_url: str | None = None) -> None:
         normalized_region = region.strip().lower()
         if not _REGION_PATTERN.fullmatch(normalized_region):
             raise ValueError("Регион должен быть slug из URL Auto.ru, например tver или moskva")
         if radius is not None and radius < 0:
             raise ValueError("Радиус поиска не может быть отрицательным")
+        _validate_price_range(min_price, max_price)
         self.region = normalized_region
         self.radius = radius
+        self.min_price = min_price
+        self.max_price = max_price
         self.search_url = search_url.strip() if search_url else None
 
     def build_search_url(self, query: str) -> str:
         if self.search_url:
-            return _validate_search_url(self.search_url)
+            parts = urlsplit(_validate_search_url(self.search_url))
+            parameters = [
+                (key, value)
+                for key, value in parse_qsl(
+                    parts.query,
+                    keep_blank_values=True,
+                )
+                if not (
+                    (key == "price_from" and self.min_price is not None)
+                    or (key == "price_to" and self.max_price is not None)
+                )
+            ]
+            if self.min_price is not None:
+                parameters.append(("price_from", str(self.min_price)))
+            if self.max_price is not None:
+                parameters.append(("price_to", str(self.max_price)))
+            return urlunsplit(
+                (
+                    parts.scheme,
+                    parts.netloc,
+                    parts.path,
+                    urlencode(parameters, doseq=True),
+                    "",
+                )
+            )
         normalized = " ".join(query.split())
-        path = f"/{self.region}/cars/all/"
-        if not normalized:
-            return self.base_url + path
-        return f"{self.base_url}{path}?{urlencode({'query': normalized, 'from': 'searchline'})}"
+        path = (
+            "/cars/all/"
+            if self.region == "all"
+            else f"/{self.region}/cars/all/"
+        )
+        parameters: dict[str, str | int] = {}
+        if normalized:
+            parameters.update({"query": normalized, "from": "searchline"})
+        self._add_price_filters(parameters)
+        query_string = urlencode(parameters)
+        return (
+            f"{self.base_url}{path}?{query_string}"
+            if query_string
+            else self.base_url + path
+        )
+
+    def _add_price_filters(
+        self, parameters: dict[str, str | int]
+    ) -> None:
+        if self.min_price is not None:
+            parameters["price_from"] = self.min_price
+        if self.max_price is not None:
+            parameters["price_to"] = self.max_price
 
     def build_page_url(self, search_url: str, page: int) -> str | None:
         if page < 1:

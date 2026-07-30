@@ -15,7 +15,12 @@ from auto_parser.request_governor import (
     RequestGovernor,
 )
 from auto_parser.service import SearchService
-from auto_parser.sources import source_from_name, source_label, source_name_from_url
+from auto_parser.sources import (
+    ALL_CARS_QUERY,
+    source_from_name,
+    source_label,
+    source_name_from_url,
+)
 from auto_parser.sources.base import HttpSourceError, SourceError
 from auto_parser.storage import ListingRepository
 
@@ -32,6 +37,8 @@ DETAIL_STALE_HOURS = 24
 DETAIL_MAX_CONSECUTIVE_RATE_LIMITS = 3
 DETAIL_RETRYABLE_HTTP_STATUSES = {403, 429, 439}
 MAIL_IMPORT_INTERVAL_SECONDS = 60
+DISPLAY_PRIORITY_TTL_SECONDS = 45
+BACKGROUND_SOURCES = ("avito", "drom", "auto_ru")
 
 
 def _now() -> datetime:
@@ -48,6 +55,16 @@ def _listing_is_incomplete(listing: object) -> bool:
         or not getattr(listing, "attributes", None)
         or not getattr(listing, "image_urls", None)
     )
+
+
+def _profile_source_name(profile: dict[str, object]) -> str:
+    query = str(profile.get("query") or "").strip()
+    if query.startswith(("https://", "http://")):
+        try:
+            return source_name_from_url(query)
+        except SourceError:
+            pass
+    return str(profile.get("source") or "avito")
 
 
 class BackgroundScheduler:
@@ -68,14 +85,22 @@ class BackgroundScheduler:
         self.poll_seconds = max(5, poll_seconds)
         self.source_gap_seconds = max(5, source_gap_seconds)
         self._stop_event = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._last_validation: datetime | None = _now()
-        self._last_detail_refresh: datetime | None = None
+        self._threads: dict[str, threading.Thread] = {}
+        self._last_validations: dict[str, datetime | None] = {
+            source_name: _now() for source_name in BACKGROUND_SOURCES
+        }
+        self._last_detail_refreshes: dict[str, datetime | None] = {
+            source_name: None for source_name in BACKGROUND_SOURCES
+        }
         self._source_cooldown_until: datetime | None = None
         self._reported_cooldown_until: datetime | None = None
         self._rate_limit_strikes = 0
+        self._search_cooldowns: dict[str, datetime | None] = {}
+        self._reported_cooldowns: dict[str, datetime | None] = {}
+        self._rate_limit_strikes_by_source: dict[str, int] = {}
         self.governor = RequestGovernor(database)
         self._source_governors = {"avito": self.governor}
+        self._governors_lock = threading.Lock()
         self._last_mail_import: datetime | None = None
         mail_config = MailImportConfig.from_env()
         self._mail_importer = (
@@ -83,41 +108,73 @@ class BackgroundScheduler:
         )
 
     def _governor_for(self, source_name: str) -> RequestGovernor:
-        if source_name not in self._source_governors:
-            self._source_governors[source_name] = RequestGovernor(
-                self.database,
-                namespace=source_name,
-            )
-        return self._source_governors[source_name]
+        with self._governors_lock:
+            if source_name not in self._source_governors:
+                self._source_governors[source_name] = RequestGovernor(
+                    self.database,
+                    namespace=source_name,
+                )
+            return self._source_governors[source_name]
 
     def start(self) -> None:
-        if self._thread and self._thread.is_alive():
+        if any(thread.is_alive() for thread in self._threads.values()):
             return
-        self._thread = threading.Thread(
-            target=self._run,
-            name="auto-parser-scheduler",
-            daemon=True,
+        self._stop_event.clear()
+        self._threads = {
+            source_name: threading.Thread(
+                target=self._run_source,
+                args=(source_name,),
+                name=f"auto-parser-{source_name}-worker",
+                daemon=True,
+            )
+            for source_name in BACKGROUND_SOURCES
+        }
+        for thread in self._threads.values():
+            thread.start()
+        logger.info(
+            "Фоновые потоки запущены: %s",
+            ", ".join(BACKGROUND_SOURCES),
         )
-        self._thread.start()
-        logger.info("Фоновый планировщик запущен")
 
     def stop(self) -> None:
         self._stop_event.set()
-        if self._thread:
-            self._thread.join(timeout=10)
+        for thread in self._threads.values():
+            thread.join(timeout=10)
 
-    def _run(self) -> None:
+    def _run_source(self, source_name: str) -> None:
         while not self._stop_event.is_set():
-            try:
-                self._tick()
-            except Exception:
-                logger.exception("Ошибка цикла планировщика")
+            self._tick_source_safely(source_name)
             self._stop_event.wait(self.poll_seconds)
 
+    def _tick_source_safely(self, source_name: str) -> None:
+        try:
+            self._tick_source(source_name)
+        except Exception:
+            logger.exception(
+                "Ошибка фонового потока %s; другие площадки продолжают работу",
+                source_name,
+            )
+
     def _tick(self) -> None:
+        """Run one concurrent cycle for diagnostics and backwards compatibility."""
+        threads = [
+            threading.Thread(
+                target=self._tick_source_safely,
+                args=(source_name,),
+                name=f"auto-parser-{source_name}-tick",
+            )
+            for source_name in BACKGROUND_SOURCES
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+    def _tick_source(self, source_name: str) -> None:
         now = _now()
         if (
-            self._mail_importer is not None
+            source_name == "auto_ru"
+            and self._mail_importer is not None
             and (
                 self._last_mail_import is None
                 or (now - self._last_mail_import).total_seconds()
@@ -129,35 +186,44 @@ class BackgroundScheduler:
                 self._mail_importer.poll()
             except Exception as error:
                 logger.warning("Не удалось проверить письма Auto.ru: %s", error)
-        persisted_cooldown = self.governor.cooldown_until_for("search")
+        governor = self._governor_for(source_name)
+        persisted_cooldown = governor.cooldown_until_for("search")
         if (
             persisted_cooldown is not None
             and persisted_cooldown > now
         ):
-            self._source_cooldown_until = persisted_cooldown
+            self._search_cooldowns[source_name] = persisted_cooldown
+            if source_name == "avito":
+                self._source_cooldown_until = persisted_cooldown
         search_blocked = (
-            self._source_cooldown_until is not None
-            and now < self._source_cooldown_until
+            self._search_cooldowns.get(source_name) is not None
+            and now < self._search_cooldowns[source_name]
         )
         if search_blocked:
-            if self._reported_cooldown_until != self._source_cooldown_until:
+            cooldown_until = self._search_cooldowns[source_name]
+            if self._reported_cooldowns.get(source_name) != cooldown_until:
                 remaining = max(
                     1,
                     round(
                         (
-                            self._source_cooldown_until - now
+                            cooldown_until - now
                         ).total_seconds()
                     ),
                 )
                 logger.info(
-                    "Автопоиск ожидает снятия ограничения Avito до %s "
+                    "Автопоиск %s ожидает снятия ограничения до %s "
                     "(ещё около %d с)",
-                    _iso(self._source_cooldown_until),
+                    source_label(source_name),
+                    _iso(cooldown_until),
                     remaining,
                 )
-                self._reported_cooldown_until = self._source_cooldown_until
+                self._reported_cooldowns[source_name] = cooldown_until
+                if source_name == "avito":
+                    self._reported_cooldown_until = cooldown_until
         else:
-            self._reported_cooldown_until = None
+            self._reported_cooldowns[source_name] = None
+            if source_name == "avito":
+                self._reported_cooldown_until = None
         with ListingRepository(self.database) as repository:
             profiles = [dict(row) for row in repository.search_profiles(
                 due_before=_iso(now)
@@ -165,19 +231,14 @@ class BackgroundScheduler:
         runnable_profiles = [
             profile
             for profile in profiles
-            if not (
-                search_blocked
-                and str(profile.get("source") or "avito") == "avito"
-            )
+            if _profile_source_name(profile) == source_name
+            and not search_blocked
         ]
         for index, profile in enumerate(runnable_profiles):
             if self._stop_event.is_set():
                 break
-            if (
-                str(profile.get("source") or "avito") == "avito"
-                and self._source_cooldown_until is not None
-                and _now() < self._source_cooldown_until
-            ):
+            cooldown_until = self._search_cooldowns.get(source_name)
+            if cooldown_until is not None and _now() < cooldown_until:
                 continue
             self._run_profile(profile)
             if (
@@ -187,19 +248,20 @@ class BackgroundScheduler:
                 break
 
         if (
-            self._last_detail_refresh is None
-            or now - self._last_detail_refresh
+            self._last_detail_refreshes[source_name] is None
+            or now - self._last_detail_refreshes[source_name]
             >= timedelta(minutes=DETAIL_REFRESH_INTERVAL_MINUTES)
         ):
-            self._refresh_listing_details()
-            self._last_detail_refresh = _now()
+            self._refresh_listing_details(source_name)
+            self._last_detail_refreshes[source_name] = _now()
 
         if (
-            self._last_validation is None
-            or now - self._last_validation >= self.validation_interval
+            self._last_validations[source_name] is None
+            or now - self._last_validations[source_name]
+            >= self.validation_interval
         ):
-            self._validate_existing()
-            self._last_validation = _now()
+            self._validate_existing(source_name)
+            self._last_validations[source_name] = _now()
 
     def _register_rate_limit(
         self,
@@ -211,7 +273,12 @@ class BackgroundScheduler:
     ) -> datetime:
         governor = self._governor_for(source_name)
         if kind == "search":
-            self._rate_limit_strikes += 1
+            strikes = self._rate_limit_strikes_by_source.get(source_name, 0) + 1
+            self._rate_limit_strikes_by_source[source_name] = strikes
+            if source_name == "avito":
+                self._rate_limit_strikes = strikes
+        else:
+            strikes = self._rate_limit_strikes_by_source.get(source_name, 0)
         cooldown = (
             governor.cooldown_until_for(kind)
             if already_recorded
@@ -227,11 +294,13 @@ class BackgroundScheduler:
                 RATE_LIMIT_MAX_MINUTES * 60,
                 RATE_LIMIT_BASE_MINUTES
                 * 60
-                * (2 ** (max(1, self._rate_limit_strikes) - 1)),
+                * (2 ** (max(1, strikes) - 1)),
             )
             cooldown = _now() + timedelta(seconds=exponential_seconds)
-        if kind == "search" and source_name == "avito":
-            self._source_cooldown_until = cooldown
+        if kind == "search":
+            self._search_cooldowns[source_name] = cooldown
+            if source_name == "avito":
+                self._source_cooldown_until = cooldown
         if kind.startswith("refresh_"):
             logger.warning(
                 "%s ограничил фоновое обновление (HTTP %d). "
@@ -252,20 +321,28 @@ class BackgroundScheduler:
             )
         return cooldown
 
-    def _clear_rate_limit(self) -> None:
-        self._rate_limit_strikes = 0
-        persisted = self.governor.cooldown_until_for("search")
-        self._source_cooldown_until = (
+    def _clear_rate_limit(self, source_name: str = "avito") -> None:
+        self._rate_limit_strikes_by_source[source_name] = 0
+        persisted = self._governor_for(source_name).cooldown_until_for("search")
+        self._search_cooldowns[source_name] = (
             persisted
             if persisted is not None and persisted > _now()
             else None
         )
+        if source_name == "avito":
+            self._rate_limit_strikes = 0
+            self._source_cooldown_until = self._search_cooldowns[source_name]
 
-    def _validate_existing(self) -> None:
+    def _validate_existing(self, source_name: str | None = None) -> None:
+        displayed_since = _iso(
+            _now() - timedelta(seconds=DISPLAY_PRIORITY_TTL_SECONDS)
+        )
         with ListingRepository(self.database) as repository:
             listings = repository.list_for_validation(
                 due_before=_iso(_now() - self.validation_interval),
                 limit=100,
+                source=source_name,
+                displayed_since=displayed_since,
             )
         if not listings:
             return
@@ -310,8 +387,8 @@ class BackgroundScheduler:
                 logger.warning("Объявление пропущено: %s", error)
                 continue
             with ListingRepository(self.database) as repository:
-                if status == "inactive":
-                    repository.mark_inactive(
+                if status == "sold":
+                    repository.mark_sold(
                         listing.source,
                         listing.external_id,
                         listing.last_validated_at or _iso(),
@@ -320,13 +397,21 @@ class BackgroundScheduler:
                     repository.upsert_many([listing])
                     repository.replace_listing_images(listing)
 
-    def _refresh_listing_details(self) -> None:
+    def _refresh_listing_details(self, source_name: str | None = None) -> None:
         now = _now()
+        displayed_since = _iso(
+            now - timedelta(seconds=DISPLAY_PRIORITY_TTL_SECONDS)
+        )
         listings = []
         with ListingRepository(self.database) as repository:
-            for source_name in ("avito", "auto_ru"):
+            source_names = (
+                (source_name,)
+                if source_name is not None
+                else BACKGROUND_SOURCES
+            )
+            for listing_source in source_names:
                 listings.extend(repository.list_for_detail_refresh(
-                    source_name,
+                    listing_source,
                     incomplete_due_before=_iso(
                         now - timedelta(
                             minutes=DETAIL_INCOMPLETE_RETRY_MINUTES
@@ -336,6 +421,7 @@ class BackgroundScheduler:
                         now - timedelta(hours=DETAIL_STALE_HOURS)
                     ),
                     limit=DETAIL_REFRESH_BATCH_SIZE,
+                    displayed_since=displayed_since,
                 ))
         if not listings:
             return
@@ -629,9 +715,13 @@ class BackgroundScheduler:
         count = 0
         status = "ok"
         retry_not_before: datetime | None = None
+        profile_id = int(profile["id"])
+        search_activity_id = f"search-profile-{profile_id}"
+        profile_label = str(profile.get("name") or profile.get("query") or profile_id)
+        search_activity_title = f"Автопоиск: {profile_label}"
         with ListingRepository(self.database) as repository:
             repository.begin_search_profile(
-                int(profile["id"]),
+                profile_id,
                 started_at=_iso(started),
             )
         profile_query_hint = str(profile["query"]).strip()
@@ -653,7 +743,7 @@ class BackgroundScheduler:
                     ).fetchone()[0]
                 )
                 repository.finish_search_profile(
-                    int(profile["id"]),
+                    profile_id,
                     last_run_at=_iso(started),
                     next_run_at=_iso(next_run),
                     status=status,
@@ -661,6 +751,13 @@ class BackgroundScheduler:
                 )
             logger.info("Профиль Auto.ru переведён на почтовый импорт")
             return
+        set_listing_activity(
+            profile_source_hint,
+            search_activity_id,
+            "Подключаемся к площадке…",
+            priority="search",
+            title=search_activity_title,
+        )
         try:
             profile_query = str(profile["query"]).strip()
             profile_source = str(profile.get("source") or "avito")
@@ -679,17 +776,53 @@ class BackgroundScheduler:
                     if profile["radius"] is not None
                     else None
                 ),
+                min_price=(
+                    int(profile["min_price"])
+                    if profile.get("min_price") is not None
+                    else None
+                ),
+                max_price=(
+                    int(profile["max_price"])
+                    if profile.get("max_price") is not None
+                    else None
+                ),
                 search_url=search_url,
             )
             service = SearchService(
                 source,
                 governor=self._governor_for(source.name),
             )
-            listings = service.search("" if search_url else profile_query)
-            if service.rate_limit_error is None and source.name == "avito":
-                self._clear_rate_limit()
+
+            def persist_page(
+                page_listings: list[Listing],
+                page: int,
+                total: int,
+            ) -> None:
+                nonlocal count
+                with ListingRepository(self.database) as repository:
+                    repository.upsert_many(page_listings)
+                count = total
+                set_listing_activity(
+                    source.name,
+                    search_activity_id,
+                    (
+                        f"Страница {page}: сохранено {total} объявлений "
+                        f"(новых на странице: {len(page_listings)})"
+                    ),
+                    priority="search",
+                    title=search_activity_title,
+                )
+
+            listings = service.search(
+                ""
+                if search_url or profile_query == ALL_CARS_QUERY
+                else profile_query,
+                on_page=persist_page,
+            )
+            if service.rate_limit_error is None:
+                self._clear_rate_limit(source.name)
             with ListingRepository(self.database) as repository:
-                count = repository.upsert_many(listings)
+                count = len(listings)
                 persisted = [
                     repository.get_listing(item.source, item.external_id)
                     for item in listings
@@ -826,7 +959,9 @@ class BackgroundScheduler:
         except RequestDeferredError as error:
             if error.lane == "search":
                 retry_not_before = error.retry_at
-                self._source_cooldown_until = error.retry_at
+                self._search_cooldowns[profile_source_hint] = error.retry_at
+                if profile_source_hint == "avito":
+                    self._source_cooldown_until = error.retry_at
                 status = (
                     "Автопоиск отложен своим лимитером; "
                     f"повтор после {_iso(error.retry_at)}"
@@ -869,12 +1004,30 @@ class BackgroundScheduler:
             next_run = max(next_run, retry_not_before)
         with ListingRepository(self.database) as repository:
             repository.finish_search_profile(
-                int(profile["id"]),
+                profile_id,
                 last_run_at=_iso(started),
                 next_run_at=_iso(next_run),
                 status=status[:500],
                 result_count=count,
             )
+        activity_state = (
+            "error"
+            if status.startswith("error:")
+            or retry_not_before is not None
+            else "success"
+        )
+        finish_listing_activity(
+            profile_source_hint,
+            search_activity_id,
+            (
+                f"{status}; сохранено объявлений: {count}"
+                if status != "ok"
+                else f"Поиск завершён; сохранено объявлений: {count}"
+            ),
+            priority="search",
+            state=activity_state,
+            title=search_activity_title,
+        )
         logger.info(
             "Профиль %s завершён: %s, объявлений=%d",
             profile["query"],

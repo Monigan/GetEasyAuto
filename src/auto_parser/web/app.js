@@ -15,13 +15,69 @@ const state = {
 };
 const ids = [
   "search", "min-price", "max-price", "min-mileage",
-  "max-mileage", "brand", "location", "status", "visibility", "sort"
+  "max-mileage", "source", "brand", "location", "visibility", "sort"
 ];
 const elements = Object.fromEntries(ids.map((id) => [id, document.getElementById(id)]));
 const multiFilterElements = [...document.querySelectorAll(".multi-filter")];
 const PREFERENCES_KEY = "autoscope.filters.v1";
 let refreshActivitySignature = "";
 let refreshActivityTimer;
+let latestRefreshActivity = { items: [], running_count: 0 };
+let refreshActivityOpen = false;
+let displayedListingsSignature = "";
+let displayedListingsReportedAt = 0;
+
+function displayedListingsClientId() {
+  const key = "autoscope.displayed-listings-client.v1";
+  try {
+    let clientId = sessionStorage.getItem(key);
+    if (!clientId) {
+      clientId = globalThis.crypto?.randomUUID?.()
+        || `browser-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      sessionStorage.setItem(key, clientId);
+    }
+    return clientId;
+  } catch {
+    return `browser-${Math.random().toString(36).slice(2)}`;
+  }
+}
+
+const displayedClientId = displayedListingsClientId();
+
+function reportDisplayedListings(items, force = false) {
+  const displayed = (items || []).slice(0, 100).map((item) => ({
+    source: item.source,
+    external_id: item.external_id,
+  }));
+  const signature = JSON.stringify(displayed);
+  const now = Date.now();
+  if (
+    !force
+    && signature === displayedListingsSignature
+    && now - displayedListingsReportedAt < 15000
+  ) {
+    return;
+  }
+  displayedListingsSignature = signature;
+  displayedListingsReportedAt = now;
+  fetch("/api/displayed-listings", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      client_id: displayedClientId,
+      items: displayed,
+    }),
+    keepalive: true,
+  }).catch((error) => console.warn("Не удалось передать приоритет карточек", error));
+}
+
+function setRefreshActivityOpen(open) {
+  const panel = document.getElementById("refresh-activity");
+  const trigger = document.getElementById("refresh-activity-open");
+  refreshActivityOpen = Boolean(open && latestRefreshActivity.items?.length);
+  panel.hidden = !refreshActivityOpen;
+  trigger.setAttribute("aria-expanded", String(refreshActivityOpen));
+}
 
 function loadPreferences() {
   try {
@@ -80,9 +136,9 @@ function params(includePage = true) {
     "max-price": "max_price",
     "min-mileage": "min_mileage",
     "max-mileage": "max_mileage",
+    source: "source",
     brand: "brand",
     location: "location",
-    status: "status",
     visibility: "visibility",
     sort: "sort",
   };
@@ -236,7 +292,9 @@ function renderCards(payload) {
     card.querySelector(".car-mileage").textContent = formatMileage(item.mileage_km);
     card.querySelector(".car-location").textContent = item.location || "Город не указан";
     card.querySelector(".car-published").textContent =
-      item.published_at ? `Опубликовано: ${displayPublished(item.published_at)}` : "Дата не указана";
+      item.published_at
+        ? `${item.published_at_inferred ? "Добавлено в базу" : "Опубликовано"}: ${displayPublished(item.published_at)}`
+        : "Дата не указана";
     card.querySelector(".car-description").textContent =
       item.description || "Описание пока не загружено.";
     card.querySelector(".car-seen").textContent = `Обновлено ${formatDate(item.last_seen_at)}`;
@@ -339,6 +397,7 @@ function renderRefreshActivity(payload) {
   const panel = document.getElementById("refresh-activity");
   const container = document.getElementById("refresh-activity-items");
   const items = payload.items || [];
+  latestRefreshActivity = payload;
   const wasRunning = state.activityRunning;
   state.activityRunning = Boolean(payload.running_count);
   if (!wasRunning && state.activityRunning) {
@@ -354,10 +413,13 @@ function renderRefreshActivity(payload) {
       item.state,
     ]),
   );
-  if (signature === refreshActivitySignature) return;
+  if (signature === refreshActivitySignature) {
+    if (!items.length) setRefreshActivityOpen(false);
+    return;
+  }
   refreshActivitySignature = signature;
   clearTimeout(refreshActivityTimer);
-  panel.hidden = items.length === 0;
+  setRefreshActivityOpen(items.length > 0);
   container.replaceChildren();
   if (!items.length) return;
 
@@ -388,32 +450,55 @@ function renderRefreshActivity(payload) {
     status.className = "refresh-activity-status";
     status.textContent = stateLabels[item.state] || item.state;
     button.append(info, status);
-    button.addEventListener("click", async () => {
+    if (!item.url) {
+      button.classList.add("is-information");
       button.disabled = true;
-      try {
-        const query = new URLSearchParams({
-          source: item.source,
-          external_id: item.external_id,
-          visibility: "all",
-        });
-        const response = await fetch(`/api/listings?${query}`);
-        const result = await response.json();
-        if (!response.ok || !result.items?.length) {
-          throw new Error("Карточка не найдена");
+    } else {
+      button.addEventListener("click", async () => {
+        button.disabled = true;
+        try {
+          const query = new URLSearchParams({
+            source: item.source,
+            external_id: item.external_id,
+            visibility: "all",
+          });
+          const response = await fetch(`/api/listings?${query}`);
+          const result = await response.json();
+          if (!response.ok || !result.items?.length) {
+            throw new Error("Карточка не найдена");
+          }
+          await openDetails(result.items[0]);
+        } catch (error) {
+          alert(error.message);
+        } finally {
+          button.disabled = false;
         }
-        await openDetails(result.items[0]);
-      } catch (error) {
-        alert(error.message);
-      } finally {
-        button.disabled = false;
-      }
-    });
+      });
+    }
     container.append(button);
   }
-  refreshActivityTimer = setTimeout(() => {
-    panel.hidden = true;
-  }, 3000);
+  if (!payload.running_count) {
+    refreshActivityTimer = setTimeout(
+      () => setRefreshActivityOpen(false),
+      5000,
+    );
+  }
 }
+
+document.getElementById("refresh-activity-open").addEventListener(
+  "click",
+  () => {
+    clearTimeout(refreshActivityTimer);
+    setRefreshActivityOpen(!refreshActivityOpen);
+  },
+);
+document.getElementById("refresh-activity-close").addEventListener(
+  "click",
+  () => {
+    clearTimeout(refreshActivityTimer);
+    setRefreshActivityOpen(false);
+  },
+);
 
 function renderPagination() {
   const nav = document.getElementById("pagination");
@@ -858,7 +943,9 @@ function sampleListingRow(item) {
   facts.textContent = [
     formatMileage(item.mileage_km),
     item.location || "Город не указан",
-    item.published_at ? `Опубликовано ${displayPublished(item.published_at)}` : "",
+    item.published_at
+      ? `${item.published_at_inferred ? "Добавлено в базу" : "Опубликовано"} ${displayPublished(item.published_at)}`
+      : "",
   ].filter(Boolean).join(" · ");
   const badges = document.createElement("div");
   badges.className = "sample-badges";
@@ -992,6 +1079,8 @@ function renderMarket(payload) {
     }),
   );
   renderSeriesChart("market-price-trend", payload.price_timeline, "median_price", "date");
+  renderPriceChanges(payload.price_changes || []);
+  renderSoldSummary(payload.sold_summary || {});
   renderRanking(
     "market-brands",
     payload.brands,
@@ -1015,6 +1104,114 @@ function renderMarket(payload) {
   );
   renderComposition(payload.composition);
   renderDeals(payload.deals);
+}
+
+function sourceLabel(source) {
+  return source === "auto_ru" ? "Auto.ru" : source === "drom" ? "Drom" : "Avito";
+}
+
+function renderPriceChanges(items) {
+  const root = document.getElementById("market-price-changes");
+  root.replaceChildren();
+  if (!items.length) {
+    root.append(emptyNote("Изменений цен пока не зафиксировано."));
+    return;
+  }
+  for (const item of items.slice(0, 12)) {
+    const row = document.createElement("a");
+    row.className = `price-change ${item.delta < 0 ? "is-down" : "is-up"}`;
+    row.href = item.url;
+    row.target = "_blank";
+    row.rel = "noopener noreferrer";
+    const info = document.createElement("span");
+    const title = document.createElement("strong");
+    title.textContent = item.title;
+    const meta = document.createElement("small");
+    meta.textContent = `${sourceLabel(item.source)} · ${formatDate(item.observed_at)}`;
+    info.append(title, meta);
+    const prices = document.createElement("span");
+    prices.className = "price-change-values";
+    const delta = `${item.delta > 0 ? "+" : ""}${formatMoney(item.delta)}`;
+    prices.innerHTML = `<small>${formatMoney(item.previous)} → ${formatMoney(item.current)}</small><strong>${delta}${item.delta_percent == null ? "" : ` (${item.delta_percent > 0 ? "+" : ""}${item.delta_percent}%)`}</strong>`;
+    row.append(info, prices);
+    root.append(row);
+  }
+}
+
+function renderSoldSummary(summary) {
+  const root = document.getElementById("market-sold-summary");
+  root.replaceChildren();
+  const values = [
+    ["Завершено", money.format(summary.count || 0)],
+    ["Медианная цена", summary.median_price == null ? "—" : formatMoney(summary.median_price)],
+    ["Средняя цена", summary.average_price == null ? "—" : formatMoney(summary.average_price)],
+    ["Медиана экспозиции", summary.median_days_on_market == null ? "—" : `${summary.median_days_on_market} дн.`],
+  ];
+  for (const [label, value] of values) {
+    const item = document.createElement("div");
+    const caption = document.createElement("span");
+    caption.textContent = label;
+    const strong = document.createElement("strong");
+    strong.textContent = value;
+    item.append(caption, strong);
+    root.append(item);
+  }
+}
+
+function renderSold(payload) {
+  const { summary, items } = payload;
+  setText("hero-count", money.format(summary.count));
+  setText("sold-count", `${money.format(summary.count)} шт.`);
+  const kpis = document.getElementById("sold-kpis");
+  kpis.replaceChildren();
+  const values = [
+    ["Продано / снято", summary.count, "Завершённые объявления"],
+    ["Медианная цена", summary.median_price == null ? "—" : formatMoney(summary.median_price), "Последняя или уточнённая цена"],
+    ["Средняя цена", summary.average_price == null ? "—" : formatMoney(summary.average_price), "По архиву продаж"],
+    ["Срок экспозиции", summary.median_days_on_market == null ? "—" : `${summary.median_days_on_market} дн.`, "Медиана по выборке"],
+  ];
+  for (const [label, value, note] of values) {
+    const card = document.createElement("article");
+    card.className = "market-kpi";
+    const span = document.createElement("span"); span.textContent = label;
+    const strong = document.createElement("strong"); strong.textContent = value;
+    const small = document.createElement("small"); small.textContent = note;
+    card.append(span, strong, small);
+    kpis.append(card);
+  }
+  const root = document.getElementById("sold-list");
+  root.replaceChildren();
+  document.getElementById("sold-empty").hidden = items.length > 0;
+  for (const item of items) {
+    const row = document.createElement("article");
+    row.className = "sold-row";
+    const info = document.createElement("div");
+    const title = document.createElement("a");
+    title.href = item.url; title.target = "_blank"; title.rel = "noopener noreferrer";
+    title.textContent = item.title;
+    const meta = document.createElement("small");
+    meta.textContent = [sourceLabel(item.source), item.location, item.days_on_market == null ? null : `${item.days_on_market} дн. в продаже`, item.sold_at ? `завершено ${formatDate(item.sold_at)}` : null].filter(Boolean).join(" · ");
+    info.append(title, meta);
+    const price = document.createElement("div");
+    price.className = "sold-price";
+    const caption = document.createElement("small"); caption.textContent = "Цена продажи";
+    const strong = document.createElement("strong"); strong.textContent = formatMoney(item.sold_price);
+    const edit = document.createElement("button"); edit.type = "button"; edit.className = "ghost-button"; edit.textContent = "Уточнить";
+    edit.addEventListener("click", async () => {
+      const raw = prompt("Фактическая цена продажи, ₽", item.sold_price || item.price || "");
+      if (raw == null) return;
+      const soldPrice = Number(raw.replace(/\s/g, ""));
+      if (!Number.isInteger(soldPrice) || soldPrice < 0) return alert("Введите корректную цену");
+      const response = await fetch(`/api/listings/${encodeURIComponent(item.source)}/${encodeURIComponent(item.external_id)}/sale`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sold_price: soldPrice }) });
+      const result = await response.json();
+      if (!response.ok) return alert(result.error || "Не удалось сохранить цену");
+      state.marketSignature = "";
+      refresh().catch(showError);
+    });
+    price.append(caption, strong, edit);
+    row.append(info, price);
+    root.append(row);
+  }
 }
 
 document.getElementById("analysis-open-sample").addEventListener(
@@ -1048,6 +1245,12 @@ async function refresh() {
       }
       return;
     }
+    if (state.view === "sold") {
+      const response = await fetch(`/api/sold?${params(false)}`);
+      if (!response.ok) throw new Error("Не удалось загрузить архив продаж");
+      renderSold(await response.json());
+      return;
+    }
     const query = params();
     const statsQuery = params(false);
     const [listingsResponse, statsResponse] = await Promise.all([
@@ -1059,6 +1262,7 @@ async function refresh() {
     }
     const listings = await listingsResponse.json();
     const stats = await statsResponse.json();
+    reportDisplayedListings(listings.items);
     const listingsSignature = JSON.stringify(listings);
     const statsSignature = JSON.stringify(stats);
     if (listingsSignature !== state.listingsSignature) {
@@ -1123,6 +1327,11 @@ function showError(error) {
     root.replaceChildren(emptyNote(`Ошибка загрузки аналитики: ${error.message}`));
     return;
   }
+  if (state.view === "sold") {
+    const root = document.getElementById("sold-list");
+    root.replaceChildren(emptyNote(`Ошибка загрузки архива: ${error.message}`));
+    return;
+  }
   const empty = document.getElementById("empty");
   empty.hidden = false;
   empty.querySelector("strong").textContent = "Ошибка загрузки";
@@ -1130,11 +1339,13 @@ function showError(error) {
 }
 
 function switchView(view, shouldRefresh = true) {
-  if (!["catalog", "analytics", "garage"].includes(view) || state.view === view) return;
+  if (!["catalog", "analytics", "sold", "garage"].includes(view) || state.view === view) return;
   state.view = view;
+  if (view !== "catalog") reportDisplayedListings([], true);
   state.page = 1;
   document.getElementById("catalog-view").hidden = view !== "catalog";
   document.getElementById("analytics-view").hidden = view !== "analytics";
+  document.getElementById("sold-view").hidden = view !== "sold";
   document.getElementById("garage-view").hidden = view !== "garage";
   document.getElementById("listing-filters").hidden = view === "garage";
   for (const button of document.querySelectorAll(".nav-button")) {
@@ -1143,12 +1354,15 @@ function switchView(view, shouldRefresh = true) {
     button.setAttribute("aria-current", active ? "page" : "false");
   }
   const analytics = view === "analytics";
+  const sold = view === "sold";
   const garage = view === "garage";
-  setText("view-title", garage ? "Гараж" : analytics ? "Аналитика рынка" : "Объявления");
+  setText("view-title", garage ? "Гараж" : sold ? "Проданные" : analytics ? "Аналитика рынка" : "Объявления");
   setText(
     "view-subtitle",
     garage
       ? "Автомобили в собственности, бортжурнал, обслуживание, расходы и будущие запчасти."
+      : sold
+      ? "Архив завершённых объявлений, цены продажи и срок нахождения на рынке."
       : analytics
       ? "Цены, динамика предложения, структура автопарка и варианты ниже рынка."
       : "Актуальная выборка, история цен и подробные карточки автомобилей.",
@@ -1187,7 +1401,7 @@ document.getElementById("reset").addEventListener("click", () => {
 
 fetch("/api/meta")
   .then((response) => response.json())
-  .then(({ locations, brands, attribute_options: attributeOptions }) => {
+  .then(({ locations, brands, sources, attribute_options: attributeOptions }) => {
     for (const value of locations) {
       const option = document.createElement("option");
       option.value = value;
@@ -1200,9 +1414,15 @@ fetch("/api/meta")
       option.textContent = value;
       elements.brand.append(option);
     }
+    for (const value of sources || []) {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = sourceLabel(value);
+      elements.source.append(option);
+    }
     restoreControlPreferences();
     setupMultiFilters(attributeOptions);
-    if (["analytics", "garage"].includes(savedPreferences?.view)) {
+    if (["analytics", "sold", "garage"].includes(savedPreferences?.view)) {
       switchView(savedPreferences.view, false);
     }
     savePreferences();
@@ -1218,7 +1438,9 @@ fetch("/api/meta")
 
 setInterval(pollActivity, 2000);
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) {
+  if (document.hidden) {
+    reportDisplayedListings([], true);
+  } else {
     pollActivity();
     refresh().catch(showError);
     scheduleAutoRefresh();
@@ -1226,11 +1448,24 @@ document.addEventListener("visibilitychange", () => {
 });
 
 const detailsDialog = document.getElementById("details-dialog");
+const imageLightbox = document.getElementById("image-lightbox");
 let carouselImages = [];
 let carouselIndex = 0;
 let carouselLoading = false;
 let carouselTotal = 0;
 let detailLoadToken = 0;
+let currentDetailItem = null;
+
+function renderFullscreenCarousel() {
+  if (!imageLightbox.open || !carouselImages.length) return;
+  const image = document.getElementById("lightbox-image");
+  image.src = carouselImages[carouselIndex];
+  image.alt = `Фото ${carouselIndex + 1}`;
+  setText(
+    "lightbox-count",
+    `${carouselIndex + 1} / ${carouselImages.length}`,
+  );
+}
 
 function renderCarousel() {
   const image = document.getElementById("detail-image");
@@ -1248,8 +1483,10 @@ function renderCarousel() {
     image.hidden = true;
     empty.hidden = carouselLoading;
     count.textContent = carouselLoading ? "Загружаем фотографии…" : "0 фото";
+    document.getElementById("carousel-fullscreen").hidden = true;
     return;
   }
+  document.getElementById("carousel-fullscreen").hidden = false;
   image.hidden = false;
   empty.hidden = true;
   image.src = carouselImages[carouselIndex];
@@ -1270,6 +1507,28 @@ function renderCarousel() {
     });
     thumbs.append(button);
   });
+  renderFullscreenCarousel();
+}
+
+function openFullscreenCarousel() {
+  if (!carouselImages.length) return;
+  renderFullscreenCarousel();
+  imageLightbox.showModal();
+  renderFullscreenCarousel();
+}
+
+function showPreviousImage() {
+  if (!carouselImages.length) return;
+  carouselIndex = (
+    carouselIndex - 1 + carouselImages.length
+  ) % carouselImages.length;
+  renderCarousel();
+}
+
+function showNextImage() {
+  if (!carouselImages.length) return;
+  carouselIndex = (carouselIndex + 1) % carouselImages.length;
+  renderCarousel();
 }
 
 function renderDetailAttributes(values) {
@@ -1295,6 +1554,218 @@ function renderDetailAttributes(values) {
     row.append(term, description);
     attributes.append(row);
   }
+}
+
+function renderDetailTrims(item) {
+  const root = document.getElementById("detail-trims");
+  root.replaceChildren();
+  const trims = item.trim_options || [];
+  if (!trims.length) {
+    root.append(emptyNote("Подходящие комплектации пока не найдены в базе Drom."));
+    return;
+  }
+  for (const trim of trims) {
+    const row = document.createElement("article");
+    row.className = `detail-trim${item.trim_exact ? "" : " is-suggested"}`;
+    const title = document.createElement("strong");
+    title.textContent = trim.name;
+    const details = document.createElement("small");
+    details.textContent = Object.entries(trim.attributes || {})
+      .filter(([name]) => name !== "Комплектация")
+      .map(([name, value]) => `${name}: ${value}`)
+      .join(" · ") || "Дополнительные характеристики не сохранены";
+    row.append(title, details);
+    if (trim.source_url) {
+      const link = document.createElement("a");
+      link.href = trim.source_url;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.textContent = "Источник на Drom ↗";
+      row.append(link);
+    }
+    root.append(row);
+  }
+}
+
+function renderVehicleAnalysis(vehicleAnalysis, listingAssessment = null) {
+  const root = document.getElementById("vehicle-analysis-result");
+  const stateLabel = document.getElementById("vehicle-analysis-state");
+  root.replaceChildren();
+  const analysis = vehicleAnalysis?.data;
+  const assessment = listingAssessment?.data;
+  if (!analysis) {
+    stateLabel.textContent = "Нет сохранённого анализа";
+    root.append(emptyNote("Скопируйте промт, получите JSON-ответ и сохраните его здесь."));
+    return;
+  }
+  stateLabel.textContent = vehicleAnalysis.updated_at
+    ? `Обновлено ${formatDate(vehicleAnalysis.updated_at)}`
+    : "Сохранено";
+  if (analysis.summary) {
+    const summary = document.createElement("div");
+    summary.className = "analysis-summary";
+    summary.textContent = analysis.summary;
+    root.append(summary);
+  }
+  const excludedIds = new Set(assessment?.excluded_weak_point_ids || []);
+  const relevantIds = new Set(assessment?.relevant_weak_point_ids || []);
+  const weakPoints = (analysis.weak_points || []).filter((point) => {
+    if (point.id && excludedIds.has(point.id)) return false;
+    return !relevantIds.size || !point.id || relevantIds.has(point.id);
+  });
+  if (assessment?.confirmed_maintenance?.length) {
+    const maintenance = document.createElement("div");
+    maintenance.className = "analysis-summary";
+    const heading = document.createElement("strong");
+    heading.textContent = "Учтено из описания объявления";
+    const list = document.createElement("ul");
+    assessment.confirmed_maintenance.forEach((entry) => {
+      const item = document.createElement("li");
+      item.textContent = typeof entry === "string"
+        ? entry
+        : [entry.item, entry.evidence].filter(Boolean).join(" — ");
+      list.append(item);
+    });
+    maintenance.append(heading, list);
+    root.append(maintenance);
+  }
+  for (const point of weakPoints) {
+    const row = document.createElement("div");
+    row.className = "analysis-weak-point";
+    const title = document.createElement("strong");
+    title.textContent = [point.system, point.issue].filter(Boolean).join(" — ") || "Слабое место";
+    const details = document.createElement("small");
+    const cost = point.parts_cost_min == null
+      ? ""
+      : `Запчасти: ${formatMoney(point.parts_cost_min)}–${formatMoney(point.parts_cost_max ?? point.parts_cost_min)}`;
+    details.textContent = [
+      point.symptoms && `Признаки: ${point.symptoms}`,
+      point.check && `Проверка: ${point.check}`,
+      cost,
+    ].filter(Boolean).join(" · ");
+    row.append(title, details);
+    root.append(row);
+  }
+  if (assessment?.remaining_investments?.length) {
+    const investments = document.createElement("div");
+    investments.className = "analysis-summary";
+    const heading = document.createElement("strong");
+    heading.textContent = "Вложения по этому объявлению";
+    const list = document.createElement("ul");
+    assessment.remaining_investments.forEach((entry) => {
+      const item = document.createElement("li");
+      const cost = entry.parts_cost_min == null
+        ? ""
+        : `${formatMoney(entry.parts_cost_min)}–${formatMoney(entry.parts_cost_max ?? entry.parts_cost_min)}`;
+      item.textContent = [
+        entry.name,
+        cost && `запчасти ${cost}`,
+        entry.reason,
+      ].filter(Boolean).join(" · ");
+      list.append(item);
+    });
+    investments.append(heading, list);
+    root.append(investments);
+  }
+  const budget = assessment?.parts_investment_total;
+  if (budget) {
+    const row = document.createElement("div");
+    row.className = "analysis-budget";
+    row.textContent = `Ожидаемые вложения в запчасти для этого автомобиля: ${formatMoney(budget.min)}–${formatMoney(budget.max)}${budget.notes ? ` · ${budget.notes}` : ""}`;
+    root.append(row);
+  }
+  for (const [title, values] of [
+    ["Что проверить при покупке", analysis.purchase_checklist],
+    ["Типовые запчасти", (analysis.parts || []).map((part) => [
+      part.name,
+      part.price_min == null ? "" : `${formatMoney(part.price_min)}–${formatMoney(part.price_max ?? part.price_min)}`,
+    ].filter(Boolean).join(": "))],
+  ]) {
+    if (!values?.length) continue;
+    const row = document.createElement("div");
+    row.className = "analysis-summary";
+    const heading = document.createElement("strong");
+    heading.textContent = title;
+    const list = document.createElement("ul");
+    values.forEach((value) => {
+      const item = document.createElement("li");
+      item.textContent = value;
+      list.append(item);
+    });
+    row.append(heading, list);
+    root.append(row);
+  }
+}
+
+function vehicleAnalysisPrompt(item) {
+  const vehicle = [
+    item.brand,
+    item.model,
+    item.year,
+    item.attributes?.["Комплектация"],
+  ].filter(Boolean).join(" ");
+  const description = item.description?.trim() || "Описание продавца отсутствует.";
+  return `Проанализируй автомобиль ${vehicle}. Учитывай российский рынок и возраст машины.
+
+Описание конкретного объявления:
+"""${description}"""
+
+Сформируй два независимых блока:
+1. model_analysis — полный справочник всех типовых слабых мест этой модели. Не удаляй из него неисправности из-за заявлений продавца: этот блок будет общим для всех автомобилей модели.
+2. listing_assessment — оценка только этого объявления на основе текста продавца. Если в описании прямо сказано, что узел заменён или обслужен, добавь его ID в excluded_weak_point_ids, чтобы проблема не показывалась в этой карточке. Не считай расплывчатые фразы вроде «всё обслужено» подтверждением конкретного ТО.
+
+Указывай только стоимость запчастей в рублях. Не включай стоимость работ, диагностики и сервисных нормо-часов ни в один диапазон. Не выдумывай точность: давай реалистичные диапазоны.
+
+Верни только валидный JSON без Markdown по схеме:
+{
+  "model_analysis": {
+    "summary": "общий вывод по модели",
+    "weak_points": [
+      {
+        "id": "короткий_стабильный_id",
+        "system": "узел или система",
+        "issue": "типовая проблема",
+        "symptoms": "как проявляется",
+        "check": "как проверить перед покупкой",
+        "parts_cost_min": 0,
+        "parts_cost_max": 0,
+        "priority": "high|medium|low"
+      }
+    ],
+    "purchase_checklist": ["пункт проверки"],
+    "parts": [
+      {
+        "name": "запчасть или комплект",
+        "price_min": 0,
+        "price_max": 0,
+        "replacement_interval": "когда обычно требуется"
+      }
+    ],
+    "sources": [{"title": "источник", "url": "https://..."}]
+  },
+  "listing_assessment": {
+    "description_used": true,
+    "confirmed_maintenance": [
+      {"item": "обслуженный узел", "evidence": "точная фраза или факт из описания"}
+    ],
+    "excluded_weak_point_ids": ["id проблемы, уже устранённой по описанию"],
+    "relevant_weak_point_ids": ["id оставшейся актуальной проблемы"],
+    "remaining_investments": [
+      {
+        "weak_point_id": "id",
+        "name": "необходимая запчасть",
+        "reason": "почему актуально для этого объявления",
+        "parts_cost_min": 0,
+        "parts_cost_max": 0
+      }
+    ],
+    "parts_investment_total": {
+      "min": 0,
+      "max": 0,
+      "notes": "только детали, без стоимости работ"
+    }
+  }
+}`;
 }
 
 async function loadGallery(item, token) {
@@ -1336,7 +1807,31 @@ async function loadGallery(item, token) {
           : money.format(payload.views_count),
       );
       setText("detail-published", displayPublished(payload.published_at));
+      setText(
+        "detail-published-note",
+        payload.published_at_inferred ? "Дата добавления в локальную базу" : "",
+      );
       renderDetailAttributes(payload.attributes);
+      Object.assign(item, {
+        attributes: payload.attributes,
+        year: payload.year ?? item.year,
+        trim_exact: payload.trim_exact,
+        trim_options: payload.trim_options,
+        drive2_url: payload.drive2_url,
+        vehicle_analysis: payload.vehicle_analysis,
+        published_at: payload.published_at || item.published_at,
+        published_at_inferred: payload.published_at_inferred,
+      });
+      renderDetailTrims(item);
+      item.description = payload.description || item.description;
+      item.listing_assessment = payload.listing_assessment;
+      renderVehicleAnalysis(
+        item.vehicle_analysis,
+        item.listing_assessment,
+      );
+      const drive2 = document.getElementById("detail-drive2");
+      drive2.hidden = !item.drive2_url;
+      if (item.drive2_url) drive2.href = item.drive2_url;
       renderCarousel();
       if (payload.warning) {
         warningShown = true;
@@ -1383,17 +1878,27 @@ async function loadGallery(item, token) {
 
 function openDetails(item) {
   const token = ++detailLoadToken;
+  currentDetailItem = item;
   setText("detail-brand", [item.brand, item.model].filter(Boolean).join(" · "));
   setText("detail-title", item.title);
   setText("detail-price", formatMoney(item.price));
   setText("detail-mileage", formatMileage(item.mileage_km));
   setText("detail-views", item.views_count == null ? "Не указаны" : money.format(item.views_count));
   setText("detail-published", displayPublished(item.published_at));
+  setText(
+    "detail-published-note",
+    item.published_at_inferred ? "Дата добавления в локальную базу" : "",
+  );
   setText("detail-location", item.location || "Не указан");
   setText("detail-description", item.description || "Описание пока не загружено.");
   setText("detail-load-status", "Догружаем данные объявления…");
   document.getElementById("detail-link").href = item.url;
   renderDetailAttributes(item.attributes);
+  renderDetailTrims(item);
+  renderVehicleAnalysis(item.vehicle_analysis, item.listing_assessment);
+  const drive2 = document.getElementById("detail-drive2");
+  drive2.hidden = !item.drive2_url;
+  if (item.drive2_url) drive2.href = item.drive2_url;
   carouselImages = [...new Set(item.images || [])];
   carouselIndex = 0;
   carouselTotal = 0;
@@ -1403,15 +1908,93 @@ function openDetails(item) {
   return loadGallery(item, token);
 }
 
+document.getElementById("vehicle-prompt-copy").addEventListener(
+  "click",
+  async () => {
+    if (!currentDetailItem) return;
+    const button = document.getElementById("vehicle-prompt-copy");
+    const promptText = vehicleAnalysisPrompt(currentDetailItem);
+    try {
+      await navigator.clipboard.writeText(promptText);
+      button.textContent = "Промт скопирован";
+      setTimeout(() => { button.textContent = "Скопировать промт"; }, 1800);
+    } catch {
+      window.prompt("Скопируйте промт", promptText);
+    }
+  },
+);
+
+document.getElementById("vehicle-analysis-save").addEventListener(
+  "click",
+  async () => {
+    if (!currentDetailItem) return;
+    const textarea = document.getElementById("vehicle-analysis-json");
+    const button = document.getElementById("vehicle-analysis-save");
+    let analysis;
+    try {
+      analysis = JSON.parse(textarea.value);
+    } catch {
+      alert("Ответ должен быть валидным JSON без Markdown-обёртки.");
+      return;
+    }
+    if (!analysis || Array.isArray(analysis) || typeof analysis !== "object") {
+      alert("Ожидался JSON-объект анализа.");
+      return;
+    }
+    button.disabled = true;
+    try {
+      const response = await fetch("/api/vehicle-analysis", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          source: currentDetailItem.source,
+          external_id: currentDetailItem.external_id,
+          analysis,
+        }),
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || "Не удалось сохранить анализ");
+      currentDetailItem.vehicle_analysis = payload.vehicle_analysis;
+      currentDetailItem.listing_assessment = payload.listing_assessment;
+      renderVehicleAnalysis(
+        payload.vehicle_analysis,
+        payload.listing_assessment,
+      );
+      textarea.value = "";
+      state.listingsSignature = "";
+    } catch (error) {
+      alert(error.message);
+    } finally {
+      button.disabled = false;
+    }
+  },
+);
+
 document.getElementById("carousel-prev").addEventListener("click", () => {
-  if (!carouselImages.length) return;
-  carouselIndex = (carouselIndex - 1 + carouselImages.length) % carouselImages.length;
-  renderCarousel();
+  showPreviousImage();
 });
 document.getElementById("carousel-next").addEventListener("click", () => {
-  if (!carouselImages.length) return;
-  carouselIndex = (carouselIndex + 1) % carouselImages.length;
-  renderCarousel();
+  showNextImage();
+});
+document.getElementById("carousel-fullscreen").addEventListener(
+  "click",
+  openFullscreenCarousel,
+);
+document.getElementById("detail-image").addEventListener(
+  "click",
+  openFullscreenCarousel,
+);
+document.getElementById("lightbox-prev").addEventListener(
+  "click",
+  showPreviousImage,
+);
+document.getElementById("lightbox-next").addEventListener(
+  "click",
+  showNextImage,
+);
+imageLightbox.addEventListener("keydown", (event) => {
+  if (event.key === "ArrowLeft") showPreviousImage();
+  if (event.key === "ArrowRight") showNextImage();
 });
 
 for (const dialog of document.querySelectorAll("dialog")) {
@@ -1422,8 +2005,21 @@ for (const dialog of document.querySelectorAll("dialog")) {
 }
 
 const profilesDialog = document.getElementById("profiles-dialog");
-const ALL_CARS_TVER_URL = "https://www.avito.ru/tver/avtomobili/s_probegom-ASgBAgICAUSGFMjmAQ?context=H4sIAAAAAAAA_wEmANn_YToxOntzOjE6InkiO3M6MTY6Ik5zc0RrbFcyUGlMd0hsZDMiO33JlMymJgAAAA&f=ASgBAgICAkSGFMjmAezqFJKZkAM&localPriority=0&radius=200&searchRadius=200";
+const ALL_CARS_QUERY = "__all_cars__";
+const profileForm = document.getElementById("profile-form");
 let profilesRefreshTimer;
+
+function updateAllCarsButton() {
+  const source = profileForm.elements.source.value;
+  const region = profileForm.elements.region;
+  const regionName = region.options[region.selectedIndex]?.text || region.value;
+  document.getElementById("profile-all-cars").textContent =
+    `Все авто · ${sourceLabel(source)} · ${regionName}`;
+}
+
+profileForm.elements.source.addEventListener("change", updateAllCarsButton);
+profileForm.elements.region.addEventListener("change", updateAllCarsButton);
+updateAllCarsButton();
 document.getElementById("profiles-open").addEventListener("click", () => {
   loadProfiles();
   profilesDialog.showModal();
@@ -1460,13 +2056,26 @@ async function loadProfiles() {
     const title = document.createElement("div");
     const strong = document.createElement("strong");
     const isUrlProfile = item.query.startsWith("https://");
-    strong.textContent = isUrlProfile
-      ? "Все автомобили с пробегом"
-      : item.query;
+    const isAllCarsProfile = item.query === ALL_CARS_QUERY;
+    strong.textContent = isAllCarsProfile
+      ? "Все автомобили"
+      : isUrlProfile
+        ? "Все автомобили с пробегом"
+        : item.query;
     const meta = document.createElement("small");
+    const sourceName = item.source === "auto_ru" ? "Auto.ru" : item.source === "drom" ? "Drom" : "Avito";
+    const priceRange = [
+      item.min_price == null ? null : `от ${formatMoney(item.min_price)}`,
+      item.max_price == null ? null : `до ${formatMoney(item.max_price)}`,
+    ].filter(Boolean).join(" ");
     meta.textContent = isUrlProfile
-      ? `По сохранённой ссылке · ${item.source === "auto_ru" ? "Auto.ru" : "Avito"}`
-      : `${item.source === "auto_ru" ? "Auto.ru" : "Avito"} · ${item.region} · ${item.radius ?? "любой радиус"} км`;
+      ? [`По сохранённой ссылке`, sourceName, priceRange].filter(Boolean).join(" · ")
+      : [
+          sourceName,
+          item.region,
+          item.radius == null ? "любой радиус" : `${item.radius} км`,
+          priceRange,
+        ].filter(Boolean).join(" · ");
     title.append(strong, meta);
     const interval = document.createElement("div");
     interval.textContent = `Каждые ${item.interval_minutes} мин.`;
@@ -1519,7 +2128,7 @@ async function loadProfiles() {
   }
 }
 
-document.getElementById("profile-form").addEventListener("submit", async (event) => {
+profileForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   const formElement = event.currentTarget;
   const form = new FormData(formElement);
@@ -1530,11 +2139,14 @@ document.getElementById("profile-form").addEventListener("submit", async (event)
         source: form.get("source"),
         query: form.get("query"),
         region: form.get("region"),
-        radius: Number(form.get("radius")),
+        radius: form.get("radius") === "" ? null : Number(form.get("radius")),
+        min_price: form.get("min_price") === "" ? null : Number(form.get("min_price")),
+        max_price: form.get("max_price") === "" ? null : Number(form.get("max_price")),
         interval_minutes: Number(form.get("interval_minutes")),
       }),
     });
     formElement.reset();
+    updateAllCarsButton();
     await loadProfiles();
   } catch (error) {
     alert(error.message);
@@ -1543,16 +2155,19 @@ document.getElementById("profile-form").addEventListener("submit", async (event)
 
 document.getElementById("profile-all-cars").addEventListener("click", async (event) => {
   const button = event.currentTarget;
+  const form = new FormData(profileForm);
   button.disabled = true;
   try {
     await profileRequest("/api/search-profiles", {
       method: "POST",
       body: JSON.stringify({
-        source: "avito",
-        query: ALL_CARS_TVER_URL,
-        region: "tver",
-        radius: 200,
-        interval_minutes: 60,
+        source: form.get("source"),
+        all_cars: true,
+        region: form.get("region"),
+        radius: form.get("radius") === "" ? null : Number(form.get("radius")),
+        min_price: form.get("min_price") === "" ? null : Number(form.get("min_price")),
+        max_price: form.get("max_price") === "" ? null : Number(form.get("max_price")),
+        interval_minutes: Number(form.get("interval_minutes")),
       }),
     });
     await loadProfiles();

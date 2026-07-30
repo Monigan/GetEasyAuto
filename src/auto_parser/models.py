@@ -25,6 +25,8 @@ class Listing:
     location: str | None = None
     published_at: str | None = None
     status: str = "active"
+    sold_price: int | None = None
+    sold_at: str | None = None
     last_validated_at: str | None = None
     collected_at: str = ""
     image_urls: list[str] = field(default_factory=list)

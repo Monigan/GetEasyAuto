@@ -8,6 +8,77 @@ from auto_parser.storage import ListingRepository
 
 
 class ListingRepositoryTests(unittest.TestCase):
+    def test_hidden_source_status_is_not_counted_as_sold_and_is_revalidated(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "test.db"
+            with ListingRepository(database) as repository:
+                listing = Listing(
+                    source="avito",
+                    external_id="hidden-by-source",
+                    url="https://www.avito.ru/item_hidden",
+                    title="BMW 5 серия",
+                    price=500_000,
+                    status="hidden",
+                    last_validated_at="2026-07-29T18:00:00+00:00",
+                )
+                repository.upsert_many([listing])
+                stored = repository.get_listing("avito", "hidden-by-source")
+                due = repository.list_for_validation(
+                    due_before="2026-07-30T18:00:00+00:00"
+                )
+
+        self.assertEqual(stored.status, "hidden")
+        self.assertIsNone(stored.sold_price)
+        self.assertIsNone(stored.sold_at)
+        self.assertEqual(
+            [item.external_id for item in due],
+            ["hidden-by-source"],
+        )
+
+    def test_sold_listing_keeps_final_price_and_relisting_resets_sale(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "test.db"
+            with ListingRepository(database) as repository:
+                listing = Listing(
+                    source="avito",
+                    external_id="sold-car",
+                    url="https://www.avito.ru/item_sold",
+                    title="BMW 5 серия",
+                    price=500_000,
+                )
+                repository.upsert_many([listing])
+                repository.mark_sold(
+                    "avito",
+                    "sold-car",
+                    "2026-07-29T18:00:00+00:00",
+                )
+                repository.set_sold_price("avito", "sold-car", 480_000)
+                sold = repository.get_listing("avito", "sold-car")
+
+                listing.price = 490_000
+                listing.status = "active"
+                listing.collected_at = "2026-07-30T18:00:00+00:00"
+                repository.upsert_many([listing])
+                relisted = repository.get_listing("avito", "sold-car")
+                listing.price = 500_000
+                listing.collected_at = "2026-07-31T18:00:00+00:00"
+                repository.upsert_many([listing])
+                history = repository.connection.execute(
+                    """
+                    SELECT price FROM price_history
+                    WHERE source = 'avito' AND external_id = 'sold-car'
+                    ORDER BY observed_at
+                    """
+                ).fetchall()
+
+        self.assertEqual(sold.status, "sold")
+        self.assertEqual(sold.sold_price, 480_000)
+        self.assertEqual(sold.sold_at, "2026-07-29T18:00:00+00:00")
+        self.assertEqual(relisted.status, "active")
+        self.assertIsNone(relisted.sold_price)
+        self.assertIsNone(relisted.sold_at)
+        self.assertEqual([row["price"] for row in history], [500_000, 490_000, 500_000])
+
     def test_detail_refresh_prioritizes_incomplete_due_listing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "test.db"
@@ -83,6 +154,126 @@ class ListingRepositoryTests(unittest.TestCase):
         self.assertEqual(
             [listing.external_id for listing in due],
             ["old"],
+        )
+
+    def test_displayed_listing_has_detail_refresh_priority(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "test.db"
+            with ListingRepository(database) as repository:
+                repository.upsert_many(
+                    [
+                        Listing(
+                            source="drom",
+                            external_id="background",
+                            url="https://auto.drom.ru/background.html",
+                            title="Background",
+                        ),
+                        Listing(
+                            source="drom",
+                            external_id="displayed",
+                            url="https://auto.drom.ru/displayed.html",
+                            title="Displayed",
+                        ),
+                    ]
+                )
+                repository.mark_detail_attempted(
+                    "drom",
+                    "background",
+                    "2026-07-20T08:00:00+00:00",
+                )
+                repository.mark_detail_attempted(
+                    "drom",
+                    "displayed",
+                    "2026-07-21T08:00:00+00:00",
+                )
+                repository.set_displayed_listings(
+                    "browser-test",
+                    [("drom", "displayed")],
+                    seen_at="2026-07-30T08:00:00+00:00",
+                )
+                selected = repository.list_for_detail_refresh(
+                    "drom",
+                    incomplete_due_before="2026-07-29T08:00:00+00:00",
+                    stale_due_before="2026-07-29T08:00:00+00:00",
+                    displayed_since="2026-07-30T07:59:00+00:00",
+                )
+                validation = repository.list_for_validation(
+                    source="drom",
+                    displayed_since="2026-07-30T07:59:00+00:00",
+                )
+
+        self.assertEqual(selected[0].external_id, "displayed")
+        self.assertEqual(validation[0].external_id, "displayed")
+
+    def test_drom_trim_is_reused_for_matching_model_and_year(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "test.db"
+            with ListingRepository(database) as repository:
+                repository.upsert_many(
+                    [
+                        Listing(
+                            source="drom",
+                            external_id="drom-trim",
+                            url="https://auto.drom.ru/bmw/1.html",
+                            title="BMW 3-Series, 1995",
+                            brand="BMW",
+                            model="3-Series",
+                            attributes={
+                                "Год выпуска": "1995",
+                                "Комплектация": "316i MT",
+                                "Мощность": "102 л.с.",
+                            },
+                        )
+                    ]
+                )
+                trims = repository.matching_trims(
+                    "BMW",
+                    "3 серия",
+                    1995,
+                )
+                repository.save_vehicle_analysis(
+                    "BMW",
+                    "3-Series",
+                    1995,
+                    {"summary": "Проверить систему охлаждения"},
+                    updated_at="2026-07-30T08:00:00+00:00",
+                )
+                analysis = repository.vehicle_analysis(
+                    "BMW",
+                    "3 серия",
+                    1995,
+                )
+                repository.save_listing_vehicle_assessment(
+                    "avito",
+                    "specific-car",
+                    {
+                        "excluded_weak_point_ids": ["cooling"],
+                        "parts_investment_total": {
+                            "min": 10000,
+                            "max": 20000,
+                        },
+                    },
+                    description_snapshot="Помпа заменена",
+                    updated_at="2026-07-30T08:00:00+00:00",
+                )
+                assessment = repository.listing_vehicle_assessment(
+                    "avito",
+                    "specific-car",
+                )
+
+        self.assertEqual([trim["name"] for trim in trims], ["316i MT"])
+        self.assertEqual(trims[0]["attributes"]["Мощность"], "102 л.с.")
+        self.assertEqual(
+            analysis["data"]["summary"],
+            "Проверить систему охлаждения",
+        )
+        self.assertEqual(
+            assessment["data"]["excluded_weak_point_ids"],
+            ["cooling"],
+        )
+        self.assertEqual(
+            assessment["description_snapshot"],
+            "Помпа заменена",
         )
 
     def test_hidden_state_survives_repository_reopen(self) -> None:
@@ -180,6 +371,8 @@ class ListingRepositoryTests(unittest.TestCase):
                     query="Volvo XC90",
                     region="tver",
                     radius=200,
+                    min_price=500_000,
+                    max_price=1_500_000,
                     interval_minutes=60,
                     created_at="2026-07-25T10:00:00+00:00",
                 )
@@ -198,6 +391,8 @@ class ListingRepositoryTests(unittest.TestCase):
                 finished = dict(repository.search_profiles()[0])
 
             self.assertEqual(running["last_status"], "running")
+            self.assertEqual(running["min_price"], 500_000)
+            self.assertEqual(running["max_price"], 1_500_000)
             self.assertEqual(finished["last_status"], "ok")
             self.assertEqual(finished["last_result_count"], 12)
 

@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import re
+from html import unescape as html_unescape
 from html.parser import HTMLParser
 from typing import Any, Iterable
 from urllib.parse import (
@@ -27,6 +28,22 @@ CAR_CATEGORY_PATHS = {
 }
 
 _REGION_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
+
+def _validate_price_range(
+    min_price: int | None,
+    max_price: int | None,
+) -> None:
+    if min_price is not None and min_price < 0:
+        raise ValueError("Минимальная цена не может быть отрицательной")
+    if max_price is not None and max_price < 0:
+        raise ValueError("Максимальная цена не может быть отрицательной")
+    if (
+        min_price is not None
+        and max_price is not None
+        and min_price > max_price
+    ):
+        raise ValueError("Минимальная цена не может быть больше максимальной")
 logger = logging.getLogger(__name__)
 _VOID_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"}
 
@@ -149,6 +166,7 @@ class _DetailPageParser(HTMLParser):
         self.image_urls: list[str] = []
         self.date_chunks: list[str] = []
         self.views_chunks: list[str] = []
+        self.status_chunks: list[str] = []
         self.attributes: dict[str, str] = {}
         self.param_item: tuple[int, list[str]] | None = None
 
@@ -160,7 +178,13 @@ class _DetailPageParser(HTMLParser):
             self.depth += 1
 
         marker = attributes.get("data-marker", "").lower()
-        if "description" in marker:
+        if (
+            "item-status" in marker
+            or "closed-warning" in marker
+            or marker.endswith("/status")
+        ):
+            self.capture = ("status", self.depth)
+        elif "description" in marker:
             self.capture = ("description", self.depth)
         elif "total-views" in marker or marker.endswith("/views"):
             self.capture = ("views", self.depth)
@@ -200,6 +224,8 @@ class _DetailPageParser(HTMLParser):
             self.views_chunks.append(data)
         elif self.capture[0] == "date":
             self.date_chunks.append(data)
+        elif self.capture[0] == "status":
+            self.status_chunks.append(data)
 
     def handle_endtag(self, tag: str) -> None:
         if tag in _VOID_TAGS:
@@ -239,6 +265,8 @@ class AvitoSource(Source):
         *,
         region: str = "all",
         radius: int | None = None,
+        min_price: int | None = None,
+        max_price: int | None = None,
         search_url: str | None = None,
     ) -> None:
         normalized_region = region.strip().lower()
@@ -248,8 +276,11 @@ class AvitoSource(Source):
             )
         if radius is not None and radius < 0:
             raise ValueError("Радиус поиска не может быть отрицательным")
+        _validate_price_range(min_price, max_price)
         self.region = normalized_region
         self.radius = radius
+        self.min_price = min_price
+        self.max_price = max_price
         self.search_url = search_url.strip() if search_url else None
         self.query_brand: str | None = None
         self.query_model: str | None = None
@@ -259,7 +290,9 @@ class AvitoSource(Source):
 
     def build_search_urls(self, query: str) -> list[str]:
         if self.search_url:
-            primary = _validate_search_url(self.search_url)
+            primary = self._with_price_filters(
+                _validate_search_url(self.search_url)
+            )
             normalized = " ".join(query.split())
             self.query_brand, self.query_model = _split_brand_model(normalized)
             if not normalized:
@@ -269,7 +302,18 @@ class AvitoSource(Source):
 
         normalized = " ".join(query.split())
         if not normalized:
-            raise ValueError("Поисковый запрос не может быть пустым")
+            path = f"/{self.region}/avtomobili"
+            parameters: dict[str, str | int] = {"cd": 1}
+            if self.radius is not None:
+                parameters.update(
+                    {
+                        "localPriority": 0,
+                        "radius": self.radius,
+                        "searchRadius": self.radius,
+                    }
+                )
+            self._add_price_filters(parameters)
+            return [f"{self.base_url}{path}?{urlencode(parameters)}"]
         self.query_brand, self.query_model = _split_brand_model(normalized)
 
         category_path = CAR_CATEGORY_PATHS.get(normalized.casefold())
@@ -287,6 +331,7 @@ class AvitoSource(Source):
                     "searchRadius": self.radius,
                 }
             )
+        self._add_price_filters(parameters)
         primary = f"{self.base_url}{path}?{urlencode(parameters)}"
         return [primary, self._build_text_search_url(normalized)]
 
@@ -300,9 +345,45 @@ class AvitoSource(Source):
                     "searchRadius": self.radius,
                 }
             )
+        self._add_price_filters(parameters)
         return (
             f"{self.base_url}/{self.region}/avtomobili?"
             f"{urlencode(parameters)}"
+        )
+
+    def _add_price_filters(
+        self, parameters: dict[str, str | int]
+    ) -> None:
+        if self.min_price is not None:
+            parameters["pmin"] = self.min_price
+        if self.max_price is not None:
+            parameters["pmax"] = self.max_price
+
+    def _with_price_filters(self, url: str) -> str:
+        parts = urlsplit(url)
+        parameters = [
+            (key, value)
+            for key, value in parse_qsl(
+                parts.query,
+                keep_blank_values=True,
+            )
+            if not (
+                (key == "pmin" and self.min_price is not None)
+                or (key == "pmax" and self.max_price is not None)
+            )
+        ]
+        if self.min_price is not None:
+            parameters.append(("pmin", str(self.min_price)))
+        if self.max_price is not None:
+            parameters.append(("pmax", str(self.max_price)))
+        return urlunsplit(
+            (
+                parts.scheme,
+                parts.netloc,
+                parts.path,
+                urlencode(parameters, doseq=True),
+                "",
+            )
         )
 
     def build_page_url(self, search_url: str, page: int) -> str | None:
@@ -364,6 +445,12 @@ class AvitoSource(Source):
 
     def enrich_listing(self, listing: Listing, html: str) -> Listing:
         _raise_for_block_page(html)
+        detected_status = _detect_listing_status(html)
+        logger.info(
+            "Статус объявления Avito %s: %s",
+            listing.external_id,
+            detected_status,
+        )
 
         structured = _StructuredDataParser()
         structured.feed(html)
@@ -427,7 +514,19 @@ class AvitoSource(Source):
                 listing.image_urls + detail_parser.image_urls
             )
         )
-        listing.status = "active"
+        listing.attributes.pop("Статус на площадке", None)
+        listing.status = detected_status
+        if detected_status == "sold":
+            listing.attributes["Статус на площадке"] = "Продано"
+            listing.sold_price = listing.sold_price or listing.price
+            listing.sold_at = listing.sold_at or utc_now_iso()
+        elif detected_status == "hidden":
+            listing.attributes["Статус на площадке"] = "Скрыто"
+            listing.sold_price = None
+            listing.sold_at = None
+        else:
+            listing.sold_price = None
+            listing.sold_at = None
         listing.last_validated_at = utc_now_iso()
         return listing
 
@@ -599,6 +698,47 @@ def _extract_views_from_html(html: str) -> int | None:
         if match:
             return int(match.group(1))
     return None
+
+
+def _detect_listing_status(html: str) -> str:
+    """Recognize Avito lifecycle state without treating every HTTP 200 as active."""
+    normalized = html_unescape(html).casefold()
+
+    sold_json_patterns = (
+        r'"(?:isitemsold|itemissold|issold)"\s*:\s*true\b',
+        r'"(?:itemstatus|listingstatus|adstatus|salestatus)"\s*:\s*"sold"',
+        r'"(?:closereason|closedreason|deactivationreason)"\s*:\s*"sold"',
+        r'"availability"\s*:\s*"[^"]*(?:soldout|outofstock)[^"]*"',
+    )
+    hidden_json_patterns = (
+        r'"(?:isitemhidden|itemishidden)"\s*:\s*true\b',
+        r'"(?:itemstatus|listingstatus|adstatus)"\s*:\s*"hidden"',
+        r'"(?:closereason|closedreason|deactivationreason)"\s*:\s*"hidden"',
+    )
+    if any(re.search(pattern, normalized) for pattern in sold_json_patterns):
+        return "sold"
+    if any(re.search(pattern, normalized) for pattern in hidden_json_patterns):
+        return "hidden"
+
+    parser = _DetailPageParser()
+    parser.feed(html)
+    status_text = _joined(parser.status_chunks).casefold()
+    sold_phrases = (
+        "автомобиль продан",
+        "машина продана",
+        "объявление продано",
+        "товар продан",
+    )
+    hidden_phrases = (
+        "объявление скрыто",
+        "объявление временно скрыто",
+        "автор скрыл объявление",
+    )
+    if any(phrase in status_text for phrase in sold_phrases):
+        return "sold"
+    if any(phrase in status_text for phrase in hidden_phrases):
+        return "hidden"
+    return "active"
 
 
 def _extract_structured_attributes(candidate: dict[str, Any]) -> dict[str, str]:

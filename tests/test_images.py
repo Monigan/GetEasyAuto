@@ -12,6 +12,21 @@ from auto_parser.images import (
 
 
 class ImageTests(unittest.TestCase):
+    def test_deduplicates_drom_sizes_and_subdomains(self) -> None:
+        small = "https://s12.auto.drom.ru/photo/v2/photo-token/gen272wb.jpg"
+        large = "https://s.auto.drom.ru/photo/v2/photo-token/gen1200.jpg"
+        second = "https://s1.auto.drom.ru/photo/v2/second-photo/gen600.jpg"
+
+        self.assertEqual(
+            deduplicate_image_urls([small, large, second]),
+            [large, second],
+        )
+        self.assertEqual(image_identity(small), image_identity(large))
+        self.assertEqual(
+            remap_cached_images([large], {small: "cached.jpg"}),
+            {large: "cached.jpg"},
+        )
+
     def test_deduplicates_auto_ru_sizes_and_keeps_largest(self) -> None:
         small = "https://avatars.avto.ru/get-autoru-vos/1/photo/320x240"
         large = "https://avatars.avto.ru/get-autoru-vos/1/photo/1200x900"

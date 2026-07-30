@@ -20,15 +20,24 @@
         <button class="nav-button" type="button" data-view="analytics">
           Аналитика рынка
         </button>
+        <button class="nav-button" type="button" data-view="sold">
+          Проданные
+        </button>
         <button class="nav-button" type="button" data-view="garage">
           Гараж
         </button>
       </nav>
       <div class="topbar-actions">
-        <div class="topbar-note">
+        <button
+          id="refresh-activity-open"
+          class="topbar-note"
+          type="button"
+          aria-controls="refresh-activity"
+          aria-expanded="false"
+        >
           <span class="status-dot"></span>
           База обновляется
-        </div>
+        </button>
         <button id="notifications-open" class="notification-button" type="button">
           Уведомления
           <span id="notifications-badge" class="notification-badge" hidden>0</span>
@@ -76,6 +85,10 @@
           <input id="max-mileage" type="number" min="0" step="10000" placeholder="Без лимита">
         </label>
         <label>
+          <span>Площадка</span>
+          <select id="source"><option value="">Все площадки</option></select>
+        </label>
+        <label>
           <span>Марка</span>
           <select id="brand"><option value="">Все марки</option></select>
         </label>
@@ -84,18 +97,11 @@
           <select id="location"><option value="">Все города</option></select>
         </label>
         <label>
-          <span>Статус</span>
-          <select id="status">
-            <option value="">Все статусы</option>
-            <option value="active">Активные</option>
-            <option value="inactive">Снятые с публикации</option>
-          </select>
-        </label>
-        <label>
           <span>Видимость</span>
           <select id="visibility">
             <option value="visible">Только видимые</option>
             <option value="hidden">Только скрытые</option>
+            <option value="source_hidden">Скрытые на площадке</option>
             <option value="all">Все объявления</option>
           </select>
         </label>
@@ -175,8 +181,14 @@
             <span class="refresh-activity-dot" aria-hidden="true"></span>
             <strong id="refresh-activity-title">Фоновое обновление</strong>
           </div>
-          <small>Активные операции и результат последнего прохода</small>
+          <button
+            id="refresh-activity-close"
+            class="refresh-activity-close"
+            type="button"
+            aria-label="Свернуть панель обновления"
+          >×</button>
         </div>
+        <small class="refresh-activity-caption">Активные операции и результат последнего прохода</small>
         <div id="refresh-activity-items" class="refresh-activity-items"></div>
       </section>
 
@@ -273,6 +285,22 @@
             <div id="market-price-trend" class="svg-chart compact-chart"></div>
           </article>
 
+          <article class="chart-panel chart-wide">
+            <div class="panel-heading">
+              <div><span>История</span><h3>Изменения цен в объявлениях</h3></div>
+              <small>Последние зафиксированные повышения и снижения</small>
+            </div>
+            <div id="market-price-changes" class="price-changes"></div>
+          </article>
+
+          <article class="chart-panel chart-wide">
+            <div class="panel-heading">
+              <div><span>Продажи</span><h3>Завершённые объявления</h3></div>
+              <small>По последней цене объявления или уточнённой цене продажи</small>
+            </div>
+            <div id="market-sold-summary" class="sold-summary"></div>
+          </article>
+
           <article class="chart-panel">
             <div class="panel-heading">
               <div><span>Марки</span><h3>Структура предложения</h3></div>
@@ -315,6 +343,23 @@
             <div id="market-deals" class="deals-table"></div>
           </article>
         </section>
+      </section>
+
+      <section id="sold-view" class="app-view sold-view" hidden>
+        <div id="sold-kpis" class="market-kpis" aria-label="Показатели проданных автомобилей"></div>
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Архив рынка</p>
+            <h2>Проданные автомобили</h2>
+            <p>Цена продажи сначала равна последней цене объявления. Её можно уточнить вручную.</p>
+          </div>
+          <span id="sold-count" class="result-count">—</span>
+        </div>
+        <div id="sold-list" class="sold-list" aria-live="polite"></div>
+        <div id="sold-empty" class="empty" hidden>
+          <strong>Проданных объявлений пока нет</strong>
+          <p>Они появятся после фоновой проверки недоступных или снятых карточек.</p>
+        </div>
       </section>
 
       <section id="garage-view" class="app-view garage-view" hidden>
@@ -443,7 +488,8 @@
         <section>
           <div class="carousel">
             <button id="carousel-prev" type="button" aria-label="Предыдущее фото">‹</button>
-            <img id="detail-image" alt="">
+            <img id="detail-image" alt="" title="Открыть на весь экран">
+            <button id="carousel-fullscreen" type="button" aria-label="Открыть фото на весь экран">⛶</button>
             <div id="detail-image-empty">Нет локальных фотографий</div>
             <div id="carousel-loader" class="carousel-loader" hidden>
               <span class="loader-spinner" aria-hidden="true"></span>
@@ -461,7 +507,11 @@
           <div class="detail-summary">
             <div><span>Пробег</span><strong id="detail-mileage"></strong></div>
             <div><span>Просмотры</span><strong id="detail-views"></strong></div>
-            <div><span>Опубликовано</span><strong id="detail-published"></strong></div>
+            <div>
+              <span>Опубликовано</span>
+              <strong id="detail-published"></strong>
+              <small id="detail-published-note"></small>
+            </div>
             <div><span>Город</span><strong id="detail-location"></strong></div>
           </div>
           <h3>Описание</h3>
@@ -469,11 +519,46 @@
           <p id="detail-load-status" class="detail-load-status" role="status"></p>
           <h3>Характеристики</h3>
           <dl id="detail-attributes" class="attributes"></dl>
-          <a id="detail-link" class="acid-link" target="_blank" rel="noopener noreferrer">
-            Открыть исходное объявление ↗
-          </a>
+          <h3>Комплектация</h3>
+          <div id="detail-trims" class="detail-trims"></div>
+          <div class="detail-links">
+            <a id="detail-link" class="acid-link" target="_blank" rel="noopener noreferrer">
+              Исходное объявление ↗
+            </a>
+            <a id="detail-drive2" class="ghost-link" target="_blank" rel="noopener noreferrer">
+              Бортжурналы на DRIVE2 ↗
+            </a>
+          </div>
+          <section class="vehicle-analysis">
+            <div class="vehicle-analysis-heading">
+              <div>
+                <h3>Слабые места и вложения</h3>
+                <p>Общие неисправности сохраняются для модели, а ТО и вложения из описания — только для этого объявления. Цены учитывают только запчасти.</p>
+              </div>
+              <span id="vehicle-analysis-state"></span>
+            </div>
+            <div id="vehicle-analysis-result" class="vehicle-analysis-result"></div>
+            <div class="vehicle-analysis-actions">
+              <button id="vehicle-prompt-copy" class="ghost-button" type="button">Скопировать промт</button>
+              <a class="ghost-link" href="https://chatgpt.com/" target="_blank" rel="noopener noreferrer">Открыть ChatGPT ↗</a>
+            </div>
+            <details class="vehicle-analysis-import">
+              <summary>Добавить ответ в базу</summary>
+              <p>Вставьте JSON, который вернул ChatGPT.</p>
+              <textarea id="vehicle-analysis-json" rows="9" spellcheck="false" placeholder='{"summary":"…","weak_points":[],"purchase_checklist":[],"parts":[],"estimated_initial_investment":{"min":0,"max":0,"notes":"…"}}'></textarea>
+              <button id="vehicle-analysis-save" class="primary-button" type="button">Сохранить анализ</button>
+            </details>
+          </section>
         </section>
       </div>
+    </dialog>
+
+    <dialog id="image-lightbox" class="image-lightbox">
+      <button class="dialog-close" type="button" aria-label="Закрыть полноэкранное фото">×</button>
+      <button id="lightbox-prev" class="lightbox-arrow lightbox-prev" type="button" aria-label="Предыдущее фото">‹</button>
+      <img id="lightbox-image" alt="">
+      <button id="lightbox-next" class="lightbox-arrow lightbox-next" type="button" aria-label="Следующее фото">›</button>
+      <span id="lightbox-count"></span>
     </dialog>
 
     <dialog id="market-sample-dialog" class="dialog market-sample-dialog">
@@ -500,18 +585,19 @@
       <form id="profile-form" class="profile-form">
         <label>
           <span>Источник</span>
-          <select name="source">
+          <select id="profile-source" name="source">
             <option value="avito" selected>Avito</option>
             <option value="auto_ru">Auto.ru — через почтовые уведомления</option>
+            <option value="drom">Drom</option>
           </select>
         </label>
-        <label>
+        <label class="profile-query-field">
           <span>Запрос или ссылка на выдачу</span>
-          <input name="query" required placeholder="Volvo XC90 или https://auto.ru/…">
+          <input name="query" required placeholder="Volvo XC90 или ссылка на выдачу">
         </label>
         <label>
           <span>Регион</span>
-          <select name="region" required>
+          <select id="profile-region" name="region" required>
             <option value="all">Вся Россия</option>
             <option value="moskva">Москва</option>
             <option value="moskovskaya_oblast">Московская область</option>
@@ -534,11 +620,19 @@
         </label>
         <label>
           <span>Радиус, км</span>
-          <input name="radius" type="number" min="0" value="200">
+          <input id="profile-radius" name="radius" type="number" min="0" value="200">
+        </label>
+        <label>
+          <span>Цена от, ₽</span>
+          <input id="profile-min-price" name="min_price" type="number" min="0" step="10000" placeholder="Без минимума">
+        </label>
+        <label>
+          <span>Цена до, ₽</span>
+          <input id="profile-max-price" name="max_price" type="number" min="0" step="10000" placeholder="Без максимума">
         </label>
         <label>
           <span>Интервал</span>
-          <select name="interval_minutes">
+          <select id="profile-interval" name="interval_minutes">
             <option value="15">15 минут</option>
             <option value="30">30 минут</option>
             <option value="60" selected>1 час</option>
@@ -548,7 +642,7 @@
         </label>
         <div class="profile-submit-actions">
           <button id="profile-all-cars" class="ghost-button" type="button">
-            Все авто Твери
+            Все авто
           </button>
           <button class="acid-button" type="submit">Добавить поиск</button>
         </div>
@@ -561,8 +655,8 @@
       <p class="eyebrow">Персональный мониторинг</p>
       <h2>Уведомления о подходящих автомобилях</h2>
       <p class="dialog-copy">
-        Новые объявления проверяются сразу после сохранения в базе. Auto.ru может
-        поступать автоматически из писем сохранённого поиска.
+        Новые объявления проверяются сразу после сохранения в базе. Drom и Avito
+        опрашиваются напрямую, Auto.ru может поступать из писем сохранённого поиска.
       </p>
       <div id="mail-import-status" class="mail-status"></div>
       <form id="notification-rule-form" class="notification-rule-form">

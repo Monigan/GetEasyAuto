@@ -11,6 +11,8 @@ class ListingActivity:
     priority: str
     state: str
     updated_at: float
+    title: str | None = None
+    url: str | None = None
 
 
 _LOCK = threading.Lock()
@@ -35,6 +37,8 @@ def set_listing_activity(
     *,
     priority: str,
     state: str = "running",
+    title: str | None = None,
+    url: str | None = None,
 ) -> None:
     with _LOCK:
         _ACTIVITIES[(source, external_id)] = ListingActivity(
@@ -42,6 +46,8 @@ def set_listing_activity(
             priority=priority,
             state=state,
             updated_at=time.monotonic(),
+            title=title,
+            url=url,
         )
 
 
@@ -52,6 +58,8 @@ def finish_listing_activity(
     *,
     priority: str,
     state: str,
+    title: str | None = None,
+    url: str | None = None,
 ) -> None:
     if state not in {"success", "error"}:
         raise ValueError("Finished activity state must be success or error")
@@ -61,6 +69,8 @@ def finish_listing_activity(
         stage,
         priority=priority,
         state=state,
+        title=title,
+        url=url,
     )
 
 
