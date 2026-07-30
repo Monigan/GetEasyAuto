@@ -260,9 +260,17 @@ class SchedulerRateLimitTests(unittest.TestCase):
                 scheduler._run_profile(profile)
             with ListingRepository(database) as repository:
                 saved_profile = dict(repository.search_profiles()[0])
+                profile_listing = repository.connection.execute(
+                    """
+                    SELECT external_id FROM search_profile_listings
+                    WHERE profile_id = ?
+                    """,
+                    (profile["id"],),
+                ).fetchone()
 
         self.assertTrue(visible_before_return)
         self.assertEqual(saved_profile["last_result_count"], 1)
+        self.assertEqual(profile_listing["external_id"], "streamed")
 
     def test_url_profile_uses_auto_ru_source(self) -> None:
         copied_url = "https://auto.ru/tver/cars/bmw/5er/3473283/all/?query=bmw+e39"

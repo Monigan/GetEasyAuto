@@ -89,6 +89,17 @@ def _filters(
     conditions: list[str] = []
     values: list[Any] = []
     source_hidden = False
+    profile_id = _integer(query.get("profile_id", [None])[0])
+    if profile_id is not None and profile_id > 0:
+        conditions.append(
+            "EXISTS ("
+            "SELECT 1 FROM search_profile_listings spl "
+            "WHERE spl.profile_id = ? "
+            "AND spl.source = l.source "
+            "AND spl.external_id = l.external_id"
+            ")"
+        )
+        values.append(profile_id)
     if apply_visibility:
         visibility = query.get("visibility", ["visible"])[0].strip()
         if visibility == "source_hidden":
@@ -2252,6 +2263,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.scheduler:
             from auto_parser.scheduler import BackgroundScheduler
 
+            # Complete schema migrations before concurrent workers open
+            # their own SQLite connections.
+            with ListingRepository(args.database):
+                pass
             scheduler = BackgroundScheduler(
                 database=args.database,
                 cache_dir=args.cache_dir,

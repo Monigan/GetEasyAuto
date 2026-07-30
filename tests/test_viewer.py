@@ -710,6 +710,18 @@ class ViewerTests(unittest.TestCase):
                 )
                 with urlopen(create_request, timeout=5) as response:
                     created = json.load(response)
+                with ListingRepository(database) as repository:
+                    profile_listing = repository.get_listing("avito", "1")
+                    repository.remember_search_profile_listings(
+                        created["id"],
+                        [profile_listing],
+                    )
+                with urlopen(
+                    f"{base_url}/api/listings"
+                    f"?profile_id={created['id']}&visibility=all",
+                    timeout=5,
+                ) as response:
+                    profile_filtered = json.load(response)
                 all_cars_request = Request(
                     f"{base_url}/api/search-profiles",
                     data=json.dumps(
@@ -904,6 +916,11 @@ class ViewerTests(unittest.TestCase):
             )
             self.assertEqual(combined_stats["count"], 1)
             self.assertGreater(created["id"], 0)
+            self.assertEqual(profile_filtered["total"], 1)
+            self.assertEqual(
+                profile_filtered["items"][0]["external_id"],
+                "1",
+            )
             self.assertGreater(all_cars_created["id"], 0)
             self.assertEqual(profiles["items"][0]["query"], "Volvo XC90")
             self.assertTrue(

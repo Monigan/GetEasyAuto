@@ -178,6 +178,10 @@ def main(argv: list[str] | None = None) -> int:
         scheduler = None
         try:
             if args.scheduler:
+                # Complete schema migrations before concurrent workers open
+                # their own SQLite connections.
+                with ListingRepository(args.database):
+                    pass
                 scheduler = BackgroundScheduler(
                     database=args.database,
                     cache_dir=args.cache_dir,

@@ -1350,6 +1350,26 @@ input:focus, select:focus {
 .profile-query-field { grid-column: span 2; }
 .profile-submit-actions { grid-column: span 2; display: flex; justify-content: flex-end; gap: 6px; }
 .profile-submit-actions button { white-space: nowrap; }
+.active-profile-filter {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--accent), var(--line) 55%);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--accent), transparent 92%);
+}
+.active-profile-filter[hidden] { display: none; }
+.active-profile-filter button {
+  padding: 6px 9px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+}
 .profiles-list { display: grid; gap: 8px; }
 .profile-row { display: grid; grid-template-columns: 1.5fr .8fr 1fr auto; gap: 10px; align-items: center; padding: 11px 13px; border: 1px solid var(--line); border-radius: 10px; }
 .profile-row small { display: block; color: var(--muted); }

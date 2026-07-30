@@ -12,6 +12,8 @@ const state = {
   refreshPending: false,
   activityRunning: false,
   view: "catalog",
+  activeProfileId: null,
+  activeProfileLabel: "",
 };
 const ids = [
   "search", "min-price", "max-price", "min-mileage",
@@ -130,6 +132,9 @@ function restoreControlPreferences() {
 
 function params(includePage = true) {
   const query = new URLSearchParams();
+  if (state.activeProfileId != null) {
+    query.set("profile_id", String(state.activeProfileId));
+  }
   const mapping = {
     search: "q",
     "min-price": "min_price",
@@ -1381,6 +1386,7 @@ for (const element of Object.values(elements)) {
 }
 
 document.getElementById("reset").addEventListener("click", () => {
+  setActiveSearchProfile(null);
   for (const element of Object.values(elements)) {
     element.value = element.id === "sort"
       ? "recently_updated"
@@ -2009,6 +2015,27 @@ const ALL_CARS_QUERY = "__all_cars__";
 const profileForm = document.getElementById("profile-form");
 let profilesRefreshTimer;
 
+function setActiveSearchProfile(profileId, label = "") {
+  const root = document.getElementById("active-profile-filter");
+  state.activeProfileId = profileId == null ? null : Number(profileId);
+  state.activeProfileLabel = state.activeProfileId == null ? "" : label;
+  root.hidden = state.activeProfileId == null;
+  root.querySelector("strong").textContent = state.activeProfileLabel;
+  state.page = 1;
+}
+
+async function showSearchProfile(profileId, label) {
+  setActiveSearchProfile(profileId, label);
+  if (profilesDialog.open) profilesDialog.close();
+  if (state.view !== "catalog") switchView("catalog", false);
+  await refresh();
+}
+
+document.getElementById("active-profile-clear").addEventListener("click", () => {
+  setActiveSearchProfile(null);
+  refresh().catch(showError);
+});
+
 function updateAllCarsButton() {
   const source = profileForm.elements.source.value;
   const region = profileForm.elements.region;
@@ -2060,7 +2087,7 @@ async function loadProfiles() {
     strong.textContent = isAllCarsProfile
       ? "Все автомобили"
       : isUrlProfile
-        ? "Все автомобили с пробегом"
+        ? "Поиск по сохранённой ссылке"
         : item.query;
     const meta = document.createElement("small");
     const sourceName = item.source === "auto_ru" ? "Auto.ru" : item.source === "drom" ? "Drom" : "Avito";
@@ -2069,7 +2096,7 @@ async function loadProfiles() {
       item.max_price == null ? null : `до ${formatMoney(item.max_price)}`,
     ].filter(Boolean).join(" ");
     meta.textContent = isUrlProfile
-      ? [`По сохранённой ссылке`, sourceName, priceRange].filter(Boolean).join(" · ")
+      ? [item.query, sourceName, priceRange].filter(Boolean).join(" · ")
       : [
           sourceName,
           item.region,
@@ -2101,6 +2128,12 @@ async function loadProfiles() {
     }
     const actions = document.createElement("div");
     actions.className = "profile-actions";
+    const show = document.createElement("button");
+    show.textContent = state.activeProfileId === item.id ? "Показан" : "Показать";
+    show.disabled = state.activeProfileId === item.id;
+    show.addEventListener("click", () => {
+      showSearchProfile(item.id, strong.textContent).catch(showError);
+    });
     const run = document.createElement("button");
     run.textContent = "Запустить";
     run.addEventListener("click", async () => {
@@ -2120,9 +2153,13 @@ async function loadProfiles() {
     remove.textContent = "Удалить";
     remove.addEventListener("click", async () => {
       await profileRequest(`/api/search-profiles/${item.id}`, { method: "DELETE" });
+      if (state.activeProfileId === item.id) {
+        setActiveSearchProfile(null);
+        refresh().catch(showError);
+      }
       await loadProfiles();
     });
-    actions.append(run, toggle, remove);
+    actions.append(show, run, toggle, remove);
     row.append(title, interval, state, actions);
     root.append(row);
   }
@@ -2132,12 +2169,14 @@ profileForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   const formElement = event.currentTarget;
   const form = new FormData(formElement);
+  const query = String(form.get("query") || "").trim();
   try {
-    await profileRequest("/api/search-profiles", {
+    const created = await profileRequest("/api/search-profiles", {
       method: "POST",
       body: JSON.stringify({
         source: form.get("source"),
-        query: form.get("query"),
+        query,
+        all_cars: false,
         region: form.get("region"),
         radius: form.get("radius") === "" ? null : Number(form.get("radius")),
         min_price: form.get("min_price") === "" ? null : Number(form.get("min_price")),
@@ -2147,7 +2186,7 @@ profileForm.addEventListener("submit", async (event) => {
     });
     formElement.reset();
     updateAllCarsButton();
-    await loadProfiles();
+    await showSearchProfile(created.id, query);
   } catch (error) {
     alert(error.message);
   }
@@ -2170,7 +2209,10 @@ document.getElementById("profile-all-cars").addEventListener("click", async (eve
         interval_minutes: Number(form.get("interval_minutes")),
       }),
     });
-    await loadProfiles();
+    setActiveSearchProfile(null);
+    if (profilesDialog.open) profilesDialog.close();
+    if (state.view !== "catalog") switchView("catalog", false);
+    await refresh();
   } catch (error) {
     alert(error.message);
   } finally {

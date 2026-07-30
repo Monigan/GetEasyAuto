@@ -308,6 +308,20 @@ class ListingRepository:
                 ALTER TABLE search_profiles_v2 RENAME TO search_profiles;
                 """
             )
+        self.connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS search_profile_listings (
+                profile_id INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                external_id TEXT NOT NULL,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                PRIMARY KEY (profile_id, source, external_id)
+            );
+            CREATE INDEX IF NOT EXISTS search_profile_listings_listing_idx
+                ON search_profile_listings(source, external_id, profile_id);
+            """
+        )
         price_schema_row = self.connection.execute(
             "SELECT sql FROM sqlite_master "
             "WHERE type = 'table' AND name = 'price_history'"
@@ -1413,6 +1427,34 @@ class ListingRepository:
         self.connection.commit()
         return int(cursor.lastrowid)
 
+    def remember_search_profile_listings(
+        self,
+        profile_id: int,
+        listings: Iterable[Listing],
+    ) -> int:
+        count = 0
+        for listing in listings:
+            self.connection.execute(
+                """
+                INSERT INTO search_profile_listings (
+                    profile_id, source, external_id,
+                    first_seen_at, last_seen_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(profile_id, source, external_id) DO UPDATE SET
+                    last_seen_at = excluded.last_seen_at
+                """,
+                (
+                    profile_id,
+                    listing.source,
+                    listing.external_id,
+                    listing.collected_at,
+                    listing.collected_at,
+                ),
+            )
+            count += 1
+        self.connection.commit()
+        return count
+
     def update_search_profile(
         self, profile_id: int, fields: dict[str, Any]
     ) -> bool:
@@ -1439,6 +1481,10 @@ class ListingRepository:
         return cursor.rowcount > 0
 
     def delete_search_profile(self, profile_id: int) -> bool:
+        self.connection.execute(
+            "DELETE FROM search_profile_listings WHERE profile_id = ?",
+            (profile_id,),
+        )
         cursor = self.connection.execute(
             "DELETE FROM search_profiles WHERE id = ?", (profile_id,)
         )

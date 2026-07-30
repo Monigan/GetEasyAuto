@@ -8,6 +8,42 @@ from auto_parser.storage import ListingRepository
 
 
 class ListingRepositoryTests(unittest.TestCase):
+    def test_search_profile_remembers_only_its_listings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "test.db"
+            listing = Listing(
+                source="drom",
+                external_id="profile-match",
+                url="https://auto.drom.ru/profile-match.html",
+                title="BMW 5-Series",
+            )
+            with ListingRepository(database) as repository:
+                profile_id = repository.add_search_profile(
+                    source="drom",
+                    query="BMW 5-Series",
+                    region="tver",
+                    radius=200,
+                    interval_minutes=60,
+                    created_at="2026-07-30T12:00:00+00:00",
+                )
+                repository.upsert_many([listing])
+                remembered = repository.remember_search_profile_listings(
+                    profile_id,
+                    [listing],
+                )
+                row = repository.connection.execute(
+                    "SELECT * FROM search_profile_listings WHERE profile_id = ?",
+                    (profile_id,),
+                ).fetchone()
+                repository.delete_search_profile(profile_id)
+                remaining = repository.connection.execute(
+                    "SELECT COUNT(*) FROM search_profile_listings"
+                ).fetchone()[0]
+
+        self.assertEqual(remembered, 1)
+        self.assertEqual(row["external_id"], "profile-match")
+        self.assertEqual(remaining, 0)
+
     def test_hidden_source_status_is_not_counted_as_sold_and_is_revalidated(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "test.db"

@@ -801,6 +801,10 @@ class BackgroundScheduler:
                 nonlocal count
                 with ListingRepository(self.database) as repository:
                     repository.upsert_many(page_listings)
+                    repository.remember_search_profile_listings(
+                        profile_id,
+                        page_listings,
+                    )
                 count = total
                 set_listing_activity(
                     source.name,
