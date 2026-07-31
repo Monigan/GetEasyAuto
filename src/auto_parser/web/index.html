@@ -20,6 +20,9 @@
         <button class="nav-button" type="button" data-view="analytics">
           Аналитика рынка
         </button>
+        <button class="nav-button" type="button" data-view="knowledge">
+          База данных
+        </button>
         <button class="nav-button" type="button" data-view="sold">
           Проданные
         </button>
@@ -349,6 +352,29 @@
         </section>
       </section>
 
+      <section id="knowledge-view" class="app-view knowledge-view" hidden>
+        <div class="section-heading knowledge-heading">
+          <div>
+            <p class="eyebrow">База знаний ChatGPT</p>
+            <h2>Типовые слабые места автомобилей</h2>
+            <p>Общие неисправности сгруппированы строго по марке, модели и комплектации. Данные конкретных объявлений и выполненного ТО сюда не попадают.</p>
+          </div>
+          <label class="knowledge-search">
+            <span>Поиск по базе</span>
+            <input id="knowledge-search" type="search" placeholder="двигатель, охлаждение, течь масла…">
+          </label>
+        </div>
+        <div class="knowledge-kpis">
+          <article><span>Моделей и комплектаций</span><strong id="knowledge-groups">0</strong></article>
+          <article><span>Типовых неисправностей</span><strong id="knowledge-points">0</strong></article>
+        </div>
+        <div id="knowledge-list" class="knowledge-list"></div>
+        <div id="knowledge-empty" class="empty" hidden>
+          <strong>База слабых мест пока пуста</strong>
+          <p>Записи появятся после сохранения результатов анализа ChatGPT из карточек объявлений.</p>
+        </div>
+      </section>
+
       <section id="sold-view" class="app-view sold-view" hidden>
         <div id="sold-kpis" class="market-kpis" aria-label="Показатели проданных автомобилей"></div>
         <div class="section-heading">
@@ -541,6 +567,10 @@
               </div>
               <span id="vehicle-analysis-state"></span>
             </div>
+            <label class="vehicle-analysis-trim">
+              <span>Комплектация для анализа</span>
+              <select id="vehicle-analysis-trim"></select>
+            </label>
             <div id="vehicle-analysis-result" class="vehicle-analysis-result"></div>
             <div class="vehicle-analysis-actions">
               <button id="vehicle-prompt-copy" class="ghost-button" type="button">Скопировать промт</button>

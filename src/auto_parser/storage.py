@@ -108,12 +108,20 @@ class ListingRepository:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 brand_key TEXT NOT NULL,
                 model_key TEXT NOT NULL,
-                year INTEGER NOT NULL DEFAULT 0,
+                trim_key TEXT NOT NULL,
+                trim_name TEXT NOT NULL,
                 brand TEXT,
                 model TEXT,
                 analysis_json TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                UNIQUE(brand_key, model_key, year)
+                UNIQUE(brand_key, model_key, trim_key)
+            );
+            CREATE TABLE IF NOT EXISTS listing_trim_assignments (
+                source TEXT NOT NULL,
+                external_id TEXT NOT NULL,
+                trim_name TEXT NOT NULL,
+                assigned_at TEXT NOT NULL,
+                PRIMARY KEY (source, external_id)
             );
             CREATE TABLE IF NOT EXISTS listing_vehicle_assessments (
                 source TEXT NOT NULL,
@@ -245,6 +253,43 @@ class ListingRepository:
         if "garage_id" not in part_columns:
             self.connection.execute(
                 "ALTER TABLE car_parts ADD COLUMN garage_id INTEGER"
+            )
+        analysis_schema_row = self.connection.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'vehicle_analyses'"
+        ).fetchone()
+        analysis_schema = "".join(
+            str(
+                analysis_schema_row["sql"]
+                if analysis_schema_row
+                else ""
+            ).split()
+        ).lower()
+        if "unique(brand_key,model_key,trim_key)" not in analysis_schema:
+            self.connection.executescript(
+                """
+                CREATE TABLE vehicle_analyses_v2 (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    brand_key TEXT NOT NULL,
+                    model_key TEXT NOT NULL,
+                    trim_key TEXT NOT NULL,
+                    trim_name TEXT NOT NULL,
+                    brand TEXT,
+                    model TEXT,
+                    analysis_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(brand_key, model_key, trim_key)
+                );
+                INSERT OR IGNORE INTO vehicle_analyses_v2 (
+                    id, brand_key, model_key, trim_key, trim_name,
+                    brand, model, analysis_json, updated_at
+                )
+                SELECT id, brand_key, model_key, '', '',
+                       brand, model, analysis_json, updated_at
+                FROM vehicle_analyses;
+                DROP TABLE vehicle_analyses;
+                ALTER TABLE vehicle_analyses_v2 RENAME TO vehicle_analyses;
+                """
             )
         profile_columns = {
             row["name"]
@@ -780,16 +825,22 @@ class ListingRepository:
         self,
         brand: str | None,
         model: str | None,
-        year: int | None,
+        *,
+        trim_name: str | None,
     ) -> dict[str, Any] | None:
-        if not brand or not model:
+        if not brand or not model or not trim_name:
             return None
         row = self.connection.execute(
             """
-            SELECT analysis_json, updated_at FROM vehicle_analyses
-            WHERE brand_key = ? AND model_key = ? AND year = ?
+            SELECT analysis_json, updated_at, trim_name
+            FROM vehicle_analyses
+            WHERE brand_key = ? AND model_key = ? AND trim_key = ?
             """,
-            (_vehicle_key(brand), _vehicle_key(model), year or 0),
+            (
+                _vehicle_key(brand),
+                _vehicle_key(model),
+                _vehicle_key(trim_name),
+            ),
         ).fetchone()
         if row is None:
             return None
@@ -797,38 +848,113 @@ class ListingRepository:
             analysis = json.loads(row["analysis_json"])
         except (json.JSONDecodeError, TypeError):
             return None
-        return {"data": analysis, "updated_at": row["updated_at"]}
+        return {
+            "data": analysis,
+            "updated_at": row["updated_at"],
+            "trim_name": row["trim_name"],
+            "match_kind": "exact_trim",
+        }
 
     def save_vehicle_analysis(
         self,
         brand: str,
         model: str,
-        year: int | None,
+        trim_name: str,
         analysis: dict[str, Any],
         *,
         updated_at: str,
     ) -> None:
+        brand_key = _vehicle_key(brand)
+        model_key = _vehicle_key(model)
+        trim_key = _vehicle_key(trim_name)
+        if not brand_key or not model_key or not trim_key:
+            raise ValueError("Для анализа нужны марка, модель и комплектация")
         self.connection.execute(
             """
             INSERT INTO vehicle_analyses (
-                brand_key, model_key, year, brand, model,
+                brand_key, model_key, trim_key, trim_name, brand, model,
                 analysis_json, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(brand_key, model_key, year) DO UPDATE SET
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(brand_key, model_key, trim_key) DO UPDATE SET
+                trim_name = excluded.trim_name,
                 brand = excluded.brand,
                 model = excluded.model,
                 analysis_json = excluded.analysis_json,
                 updated_at = excluded.updated_at
             """,
             (
-                _vehicle_key(brand),
-                _vehicle_key(model),
-                year or 0,
+                brand_key,
+                model_key,
+                trim_key,
+                trim_name,
                 brand,
                 model,
                 json.dumps(analysis, ensure_ascii=False),
                 updated_at,
             ),
+        )
+        self.connection.commit()
+
+    def vehicle_analyses(self) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            """
+            SELECT brand, model, trim_name,
+                   analysis_json, updated_at
+            FROM vehicle_analyses
+            WHERE trim_key != ''
+            ORDER BY brand COLLATE NOCASE, model COLLATE NOCASE,
+                     trim_name COLLATE NOCASE
+            """
+        ).fetchall()
+        result = []
+        for row in rows:
+            try:
+                analysis = json.loads(row["analysis_json"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            result.append(
+                {
+                    "brand": row["brand"],
+                    "model": row["model"],
+                    "trim_name": row["trim_name"],
+                    "analysis": analysis,
+                    "updated_at": row["updated_at"],
+                }
+            )
+        return result
+
+    def listing_trim_assignment(
+        self,
+        source: str,
+        external_id: str,
+    ) -> str | None:
+        row = self.connection.execute(
+            """
+            SELECT trim_name FROM listing_trim_assignments
+            WHERE source = ? AND external_id = ?
+            """,
+            (source, external_id),
+        ).fetchone()
+        return str(row["trim_name"]) if row else None
+
+    def set_listing_trim_assignment(
+        self,
+        source: str,
+        external_id: str,
+        trim_name: str,
+        *,
+        assigned_at: str,
+    ) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO listing_trim_assignments (
+                source, external_id, trim_name, assigned_at
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT(source, external_id) DO UPDATE SET
+                trim_name = excluded.trim_name,
+                assigned_at = excluded.assigned_at
+            """,
+            (source, external_id, trim_name, assigned_at),
         )
         self.connection.commit()
 

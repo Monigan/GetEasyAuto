@@ -388,6 +388,8 @@ class ViewerHandler(
             self._meta()
         elif parsed.path == "/api/search-profiles":
             self._search_profiles()
+        elif parsed.path == "/api/vehicle-analyses":
+            self._vehicle_analyses()
         elif parsed.path == "/api/parts/cars":
             self._parts_cars()
         elif parsed.path == "/api/parts":
@@ -573,7 +575,13 @@ class ViewerHandler(
                     item["published_at"] or item["first_seen_at"]
                 )
                 exact_trim = item["attributes"].get("Комплектация")
+                assigned_trim = repository.listing_trim_assignment(
+                    item["source"],
+                    item["external_id"],
+                )
+                analysis_trim = exact_trim or assigned_trim
                 item["trim_exact"] = bool(exact_trim)
+                item["analysis_trim_name"] = analysis_trim
                 item["trim_options"] = (
                     [
                         {
@@ -601,7 +609,7 @@ class ViewerHandler(
                 item["vehicle_analysis"] = repository.vehicle_analysis(
                     item["brand"],
                     item["model"],
-                    year,
+                    trim_name=analysis_trim,
                 )
                 item["listing_assessment"] = (
                     repository.listing_vehicle_assessment(
@@ -786,10 +794,50 @@ class ViewerHandler(
             listing_assessment = analysis.get("listing_assessment")
             if not isinstance(model_analysis, dict):
                 model_analysis = analysis
+            exact_trim = listing.attributes.get("Комплектация")
+            assigned_trim = repository.listing_trim_assignment(
+                source,
+                external_id,
+            )
+            trim_name = str(
+                payload.get("trim_name")
+                or exact_trim
+                or assigned_trim
+                or ""
+            ).strip()
+            allowed_trims = {
+                trim["name"]
+                for trim in repository.matching_trims(
+                    listing.brand,
+                    listing.model,
+                    year,
+                )
+            }
+            if exact_trim:
+                allowed_trims.add(exact_trim)
+            if not trim_name or trim_name not in allowed_trims:
+                self._json(
+                    {"error": "Выберите подтверждённую комплектацию"},
+                    HTTPStatus.BAD_REQUEST,
+                )
+                return
+            if exact_trim and trim_name != exact_trim:
+                self._json(
+                    {"error": "Комплектация объявления уже определена"},
+                    HTTPStatus.BAD_REQUEST,
+                )
+                return
+            if not exact_trim:
+                repository.set_listing_trim_assignment(
+                    source,
+                    external_id,
+                    trim_name,
+                    assigned_at=utc_now_iso(),
+                )
             repository.save_vehicle_analysis(
                 listing.brand,
                 listing.model,
-                year,
+                trim_name,
                 model_analysis,
                 updated_at=utc_now_iso(),
             )
@@ -804,7 +852,7 @@ class ViewerHandler(
             saved = repository.vehicle_analysis(
                 listing.brand,
                 listing.model,
-                year,
+                trim_name=trim_name,
             )
             saved_assessment = repository.listing_vehicle_assessment(
                 source,
@@ -815,6 +863,23 @@ class ViewerHandler(
                 "saved": True,
                 "vehicle_analysis": saved,
                 "listing_assessment": saved_assessment,
+                "analysis_trim_name": trim_name,
+            }
+        )
+
+    def _vehicle_analyses(self) -> None:
+        with ListingRepository(self.database) as repository:
+            items = repository.vehicle_analyses()
+        self._json(
+            {
+                "items": items,
+                "summary": {
+                    "vehicle_groups": len(items),
+                    "weak_points": sum(
+                        len(item["analysis"].get("weak_points") or [])
+                        for item in items
+                    ),
+                },
             }
         )
 
@@ -2055,10 +2120,15 @@ class ViewerHandler(
                         refreshed_year,
                     )
                 )
+                assigned_trim = repository.listing_trim_assignment(
+                    source_name,
+                    external_id,
+                )
+                analysis_trim = exact_trim or assigned_trim
                 vehicle_analysis = repository.vehicle_analysis(
                     refreshed.brand if refreshed else None,
                     refreshed.model if refreshed else None,
-                    refreshed_year,
+                    trim_name=analysis_trim,
                 )
                 listing_assessment = (
                     repository.listing_vehicle_assessment(
@@ -2127,6 +2197,7 @@ class ViewerHandler(
                 "year": refreshed_year,
                 "trim_exact": bool(exact_trim),
                 "trim_options": trim_options,
+                "analysis_trim_name": analysis_trim,
                 "drive2_url": _drive2_url(
                     refreshed.brand if refreshed else None,
                     refreshed.model if refreshed else None,

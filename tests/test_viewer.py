@@ -122,12 +122,14 @@ class ViewerTests(unittest.TestCase):
                         {
                             "source": "avito",
                             "external_id": "target",
+                            "trim_name": "316i MT",
                             "analysis": {
                                 "model_analysis": {
                                     "summary": "Проверить охлаждение",
                                     "weak_points": [
                                         {
                                             "id": "cooling",
+                                            "fault_type": "охлаждение",
                                             "issue": "Помпа",
                                             "parts_cost_min": 10000,
                                             "parts_cost_max": 20000,
@@ -161,6 +163,11 @@ class ViewerTests(unittest.TestCase):
                     timeout=5,
                 ) as response:
                     after = json.load(response)["items"][0]
+                with urlopen(
+                    f"{base_url}/api/vehicle-analyses",
+                    timeout=5,
+                ) as response:
+                    knowledge = json.load(response)
             finally:
                 server.shutdown()
                 server.server_close()
@@ -175,6 +182,8 @@ class ViewerTests(unittest.TestCase):
         self.assertEqual(before["trim_options"][0]["name"], "316i MT")
         self.assertIn("drive2.ru/search", before["drive2_url"])
         self.assertTrue(saved["saved"])
+        self.assertEqual(saved["analysis_trim_name"], "316i MT")
+        self.assertEqual(after["analysis_trim_name"], "316i MT")
         self.assertEqual(
             after["vehicle_analysis"]["data"]["summary"],
             "Проверить охлаждение",
@@ -195,6 +204,13 @@ class ViewerTests(unittest.TestCase):
             ],
             10000,
         )
+        self.assertEqual(knowledge["summary"]["vehicle_groups"], 1)
+        self.assertEqual(knowledge["summary"]["weak_points"], 1)
+        self.assertEqual(
+            knowledge["items"][0]["analysis"]["weak_points"][0]["id"],
+            "cooling",
+        )
+        self.assertEqual(knowledge["items"][0]["trim_name"], "316i MT")
 
     def test_displayed_listings_endpoint_tracks_current_catalog_page(
         self,
@@ -268,6 +284,7 @@ class ViewerTests(unittest.TestCase):
                     title="BMW 520i",
                     price=600_000,
                     brand="BMW",
+                    collected_at="2026-07-29T12:00:00+00:00",
                 )
                 repository.upsert_many([avito])
                 avito.price = 550_000

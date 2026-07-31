@@ -54,6 +54,7 @@ class ListingRepositoryTests(unittest.TestCase):
                     url="https://www.avito.ru/item_hidden",
                     title="BMW 5 серия",
                     price=500_000,
+                    collected_at="2026-07-29T12:00:00+00:00",
                     status="hidden",
                     last_validated_at="2026-07-29T18:00:00+00:00",
                 )
@@ -81,6 +82,7 @@ class ListingRepositoryTests(unittest.TestCase):
                     url="https://www.avito.ru/item_sold",
                     title="BMW 5 серия",
                     price=500_000,
+                    collected_at="2026-07-29T12:00:00+00:00",
                 )
                 repository.upsert_many([listing])
                 repository.mark_sold(
@@ -270,14 +272,14 @@ class ListingRepositoryTests(unittest.TestCase):
                 repository.save_vehicle_analysis(
                     "BMW",
                     "3-Series",
-                    1995,
+                    "316i MT",
                     {"summary": "Проверить систему охлаждения"},
                     updated_at="2026-07-30T08:00:00+00:00",
                 )
                 analysis = repository.vehicle_analysis(
                     "BMW",
                     "3 серия",
-                    1995,
+                    trim_name="316i MT",
                 )
                 repository.save_listing_vehicle_assessment(
                     "avito",
@@ -296,6 +298,37 @@ class ListingRepositoryTests(unittest.TestCase):
                     "avito",
                     "specific-car",
                 )
+                repository.save_vehicle_analysis(
+                    "BMW",
+                    "5-Series",
+                    "523i AT",
+                    {
+                        "summary": "Типовые проблемы E39",
+                        "weak_points": [{"id": "cooling"}],
+                    },
+                    updated_at="2026-07-30T09:00:00+00:00",
+                )
+                same_trim_analysis = repository.vehicle_analysis(
+                    "BMW",
+                    "5 серия",
+                    trim_name="523i AT",
+                )
+                wrong_trim_analysis = repository.vehicle_analysis(
+                    "BMW",
+                    "5 серия",
+                    trim_name="525i AT",
+                )
+                repository.set_listing_trim_assignment(
+                    "avito",
+                    "specific-car",
+                    "523i AT",
+                    assigned_at="2026-07-30T09:00:00+00:00",
+                )
+                assigned_trim = repository.listing_trim_assignment(
+                    "avito",
+                    "specific-car",
+                )
+                analyses = repository.vehicle_analyses()
 
         self.assertEqual([trim["name"] for trim in trims], ["316i MT"])
         self.assertEqual(trims[0]["attributes"]["Мощность"], "102 л.с.")
@@ -311,6 +344,14 @@ class ListingRepositoryTests(unittest.TestCase):
             assessment["description_snapshot"],
             "Помпа заменена",
         )
+        self.assertEqual(same_trim_analysis["match_kind"], "exact_trim")
+        self.assertEqual(
+            same_trim_analysis["data"]["summary"],
+            "Типовые проблемы E39",
+        )
+        self.assertIsNone(wrong_trim_analysis)
+        self.assertEqual(assigned_trim, "523i AT")
+        self.assertEqual(len(analyses), 2)
 
     def test_hidden_state_survives_repository_reopen(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

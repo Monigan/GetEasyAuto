@@ -1255,6 +1255,9 @@ input:focus, select:focus {
   line-height: 1.5;
 }
 #vehicle-analysis-state { color: var(--muted); font-size: 10px; white-space: nowrap; }
+.vehicle-analysis-trim { display: block; margin-top: 13px; }
+.vehicle-analysis-trim span { display: block; margin-bottom: 5px; color: var(--muted); font-size: 10px; text-transform: uppercase; }
+.vehicle-analysis-trim select { width: 100%; }
 .vehicle-analysis-result { display: grid; gap: 9px; margin-top: 14px; }
 .analysis-summary, .analysis-weak-point, .analysis-budget {
   padding: 10px 12px;
@@ -1279,6 +1282,25 @@ input:focus, select:focus {
   color: var(--text);
   font: 11px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace;
 }
+.knowledge-heading { align-items: end; }
+.knowledge-heading > div > p:last-child { max-width: 760px; color: var(--muted); }
+.knowledge-search { min-width: min(320px, 100%); }
+.knowledge-search span { display: block; margin-bottom: 6px; color: var(--muted); font-size: 10px; text-transform: uppercase; }
+.knowledge-search input { width: 100%; }
+.knowledge-kpis { display: grid; grid-template-columns: repeat(2, minmax(0, 240px)); gap: 10px; margin-bottom: 18px; }
+.knowledge-kpis article { padding: 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2); }
+.knowledge-kpis span { display: block; color: var(--muted); font-size: 10px; text-transform: uppercase; }
+.knowledge-kpis strong { display: block; margin-top: 5px; font-size: 22px; }
+.knowledge-list { display: grid; gap: 13px; }
+.knowledge-card { padding: 18px; border: 1px solid var(--line); border-radius: 13px; background: var(--surface); }
+.knowledge-card header { display: flex; justify-content: space-between; gap: 14px; align-items: start; }
+.knowledge-card h3 { margin: 0; font-size: 19px; }
+.knowledge-card header small, .knowledge-card-summary { color: var(--muted); }
+.knowledge-card-summary { margin: 10px 0 14px; line-height: 1.55; }
+.knowledge-points { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 8px; }
+.knowledge-point { padding: 11px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-2); }
+.knowledge-point strong { display: block; }
+.knowledge-point p { margin: 5px 0 0; color: var(--muted); font-size: 11px; line-height: 1.45; }
 
 .market-sample-dialog { width: min(920px, calc(100vw - 28px)); }
 .market-sample-heading { padding: 30px 32px 18px; border-bottom: 1px solid var(--line); }
