@@ -290,7 +290,7 @@ class AvitoSource(Source):
 
     def build_search_urls(self, query: str) -> list[str]:
         if self.search_url:
-            primary = self._with_price_filters(
+            primary = self._without_disallowed_filters(
                 _validate_search_url(self.search_url)
             )
             normalized = " ".join(query.split())
@@ -304,15 +304,6 @@ class AvitoSource(Source):
         if not normalized:
             path = f"/{self.region}/avtomobili"
             parameters: dict[str, str | int] = {"cd": 1}
-            if self.radius is not None:
-                parameters.update(
-                    {
-                        "localPriority": 0,
-                        "radius": self.radius,
-                        "searchRadius": self.radius,
-                    }
-                )
-            self._add_price_filters(parameters)
             return [f"{self.base_url}{path}?{urlencode(parameters)}"]
         self.query_brand, self.query_model = _split_brand_model(normalized)
 
@@ -323,43 +314,17 @@ class AvitoSource(Source):
         else:
             return [self._build_text_search_url(normalized)]
 
-        if self.radius is not None:
-            parameters.update(
-                {
-                    "localPriority": 0,
-                    "radius": self.radius,
-                    "searchRadius": self.radius,
-                }
-            )
-        self._add_price_filters(parameters)
         primary = f"{self.base_url}{path}?{urlencode(parameters)}"
         return [primary, self._build_text_search_url(normalized)]
 
     def _build_text_search_url(self, query: str) -> str:
         parameters: dict[str, str | int] = {"q": query, "cd": 1}
-        if self.radius is not None:
-            parameters.update(
-                {
-                    "localPriority": 0,
-                    "radius": self.radius,
-                    "searchRadius": self.radius,
-                }
-            )
-        self._add_price_filters(parameters)
         return (
             f"{self.base_url}/{self.region}/avtomobili?"
             f"{urlencode(parameters)}"
         )
 
-    def _add_price_filters(
-        self, parameters: dict[str, str | int]
-    ) -> None:
-        if self.min_price is not None:
-            parameters["pmin"] = self.min_price
-        if self.max_price is not None:
-            parameters["pmax"] = self.max_price
-
-    def _with_price_filters(self, url: str) -> str:
+    def _without_disallowed_filters(self, url: str) -> str:
         parts = urlsplit(url)
         parameters = [
             (key, value)
@@ -367,15 +332,9 @@ class AvitoSource(Source):
                 parts.query,
                 keep_blank_values=True,
             )
-            if not (
-                (key == "pmin" and self.min_price is not None)
-                or (key == "pmax" and self.max_price is not None)
-            )
+            if key.casefold()
+            not in {"pmin", "pmax", "price", "radius", "searchradius"}
         ]
-        if self.min_price is not None:
-            parameters.append(("pmin", str(self.min_price)))
-        if self.max_price is not None:
-            parameters.append(("pmax", str(self.max_price)))
         return urlunsplit(
             (
                 parts.scheme,
@@ -385,6 +344,19 @@ class AvitoSource(Source):
                 "",
             )
         )
+
+    def filter_search_results(self, listings: list[Listing]) -> list[Listing]:
+        return [
+            listing
+            for listing in listings
+            if (
+                listing.price is None
+                or (
+                    (self.min_price is None or listing.price >= self.min_price)
+                    and (self.max_price is None or listing.price <= self.max_price)
+                )
+            )
+        ]
 
     def build_page_url(self, search_url: str, page: int) -> str | None:
         if page < 1:

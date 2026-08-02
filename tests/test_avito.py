@@ -9,15 +9,15 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 
 class AvitoSourceTests(unittest.TestCase):
-    def test_builds_url_with_price_range(self) -> None:
+    def test_applies_price_range_locally_without_disallowed_url_params(self) -> None:
         url = AvitoSource(
             region="tver",
             min_price=100_000,
             max_price=150_000,
         ).build_search_url("")
 
-        self.assertIn("pmin=100000", url)
-        self.assertIn("pmax=150000", url)
+        self.assertNotIn("pmin=", url)
+        self.assertNotIn("pmax=", url)
 
     def test_builds_all_cars_url_with_region_and_radius(self) -> None:
         url = AvitoSource(region="tver", radius=150).build_search_url("")
@@ -25,7 +25,7 @@ class AvitoSourceTests(unittest.TestCase):
         self.assertEqual(
             url,
             "https://www.avito.ru/tver/avtomobili"
-            "?cd=1&localPriority=0&radius=150&searchRadius=150",
+            "?cd=1",
         )
 
     def test_build_search_url(self) -> None:
@@ -44,12 +44,12 @@ class AvitoSourceTests(unittest.TestCase):
             url,
             "https://www.avito.ru/tver/avtomobili/"
             "bmw/5_seriya/e39-ASgBAgICA0Tgtg3klyjitg3UnCjqtg3yhCk"
-            "?cd=1&localPriority=0&radius=200&searchRadius=200",
+            "?cd=1",
         )
         self.assertEqual(
             source.build_search_urls("BMW E39")[1],
             "https://www.avito.ru/tver/avtomobili"
-            "?q=BMW+E39&cd=1&localPriority=0&radius=200&searchRadius=200",
+            "?q=BMW+E39&cd=1",
         )
 
     def test_unknown_query_uses_text_search(self) -> None:
@@ -58,7 +58,7 @@ class AvitoSourceTests(unittest.TestCase):
         self.assertEqual(
             url,
             "https://www.avito.ru/tver/avtomobili"
-            "?q=Volvo+XC90&cd=1&localPriority=0&radius=50&searchRadius=50",
+            "?q=Volvo+XC90&cd=1",
         )
 
     def test_builds_next_page_without_losing_search_filters(self) -> None:
@@ -67,7 +67,7 @@ class AvitoSourceTests(unittest.TestCase):
         second = source.build_page_url(first, 2)
 
         self.assertIn("q=Volvo+XC90", second)
-        self.assertIn("radius=200", second)
+        self.assertNotIn("radius=", second)
         self.assertIn("p=2", second)
 
     def test_accepts_copied_avito_search_url(self) -> None:
@@ -78,7 +78,8 @@ class AvitoSourceTests(unittest.TestCase):
 
         self.assertEqual(
             AvitoSource(search_url=copied).build_search_url(""),
-            copied,
+            "https://www.avito.ru/tver/avtomobili/toyota/"
+            "camry-ASgBAgICAkTgtg20mSjitg3UoCg?cd=1",
         )
 
     def test_rejects_external_search_url(self) -> None:

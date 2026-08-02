@@ -116,7 +116,7 @@ class SearchService:
                     _url_for_log(page_url),
                 )
                 try:
-                    page_listings = self._search_url(page_url)
+                    raw_page_listings = self._search_url(page_url)
                 except HttpSourceError as error:
                     if listings and error.status_code in {429, 439}:
                         self.rate_limit_error = error
@@ -128,12 +128,15 @@ class SearchService:
                         )
                         break
                     raise
-                if not page_listings:
+                if not raw_page_listings:
                     logger.info(
                         "Страница %d пуста; обход выдачи завершён",
                         page,
                     )
                     break
+                page_listings = self.source.filter_search_results(
+                    raw_page_listings
+                )
                 previous_count = len(listings)
                 new_listings: list[Listing] = []
                 for listing in page_listings:

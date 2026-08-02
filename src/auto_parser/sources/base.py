@@ -50,6 +50,10 @@ class Source(ABC):
     def parse_search_page(self, html: str) -> list[Listing]:
         raise NotImplementedError
 
+    def filter_search_results(self, listings: list[Listing]) -> list[Listing]:
+        """Apply filters which cannot safely be sent to the source."""
+        return listings
+
     def enrich_listing(self, listing: Listing, html: str) -> Listing:
         return listing
 
