@@ -1507,3 +1507,130 @@ input:focus, select:focus {
   .notification-rule-form { grid-template-columns: 1fr; }
   .notification-toolbar, .notification-row, .notification-rule-row { align-items: stretch; flex-direction: column; }
 }
+
+/* Touch-first responsive layout. */
+@media (max-width: 960px) {
+  html { scroll-padding-top: 132px; }
+  body { overflow-x: hidden; }
+  button, select, input, textarea, summary { min-height: 44px; }
+  .topbar {
+    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-areas:
+      "brand actions"
+      "nav nav";
+    height: auto;
+    padding: 10px max(16px, env(safe-area-inset-right)) 8px max(16px, env(safe-area-inset-left));
+  }
+  .brand { grid-area: brand; }
+  .primary-nav {
+    grid-area: nav;
+    width: 100%;
+    max-width: none;
+    justify-self: stretch;
+    justify-content: flex-start;
+    overflow-x: auto;
+    overscroll-behavior-inline: contain;
+    scrollbar-width: none;
+    scroll-snap-type: inline proximity;
+  }
+  .primary-nav::-webkit-scrollbar { display: none; }
+  .nav-button { flex: 0 0 auto; min-height: 42px; scroll-snap-align: start; }
+  .topbar-actions { grid-area: actions; justify-self: end; min-width: 0; }
+  .app-shell { margin-top: 18px; }
+  .page-intro { align-items: end; }
+  .filters { position: static; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .search-field { grid-column: span 2; }
+  .analytics-grid > *, .market-bottom-grid > *, .parts-layout > *,
+  .garage-layout > *, .garage-content-grid > *, .detail-layout > * { min-width: 0; }
+  .deals-table, .sold-list, .price-history, .comparison-table {
+    max-width: 100%;
+    overflow-x: auto;
+    overscroll-behavior-inline: contain;
+  }
+  .dialog {
+    max-height: calc(100dvh - 24px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+}
+
+@media (max-width: 640px) {
+  html { scroll-padding-top: 180px; }
+  .topbar {
+    grid-template-columns: 1fr;
+    grid-template-areas:
+      "brand"
+      "actions"
+      "nav";
+    gap: 7px;
+    padding-top: max(9px, env(safe-area-inset-top));
+  }
+  .brand { justify-self: center; }
+  .brand > span:last-child { display: inline; }
+  .topbar-actions {
+    width: 100%;
+    justify-self: stretch;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+  }
+  .topbar-actions > button { width: 100%; min-width: 0; padding-inline: 10px; }
+  .notification-button, .topbar-actions .primary-button { font-size: 12px; }
+  .primary-nav { padding-bottom: 2px; }
+  .nav-button { flex: 1 0 auto; padding-inline: 14px; }
+  .app-shell { width: calc(100% - 20px); }
+  .page-intro { min-height: 0; padding: 20px 0 18px; }
+  .page-intro h1 { overflow-wrap: anywhere; }
+  .filters { grid-template-columns: 1fr 1fr; gap: 9px; padding: 12px; }
+  .search-field { grid-column: span 2; }
+  .filters label, .advanced-filters, .active-profile-filter { min-width: 0; }
+  .active-profile-filter { align-items: stretch; flex-direction: column; }
+  .active-profile-filter button { width: 100%; }
+  .advanced-filters > summary { gap: 10px; }
+  .advanced-filters > summary strong { text-align: right; }
+  .multi-filter > summary { padding: 10px; }
+  .cards { gap: 12px; }
+  .car-card { border-radius: 12px; }
+  .car-image-wrap { height: clamp(190px, 58vw, 260px); }
+  .pagination { max-width: 100%; overflow-x: auto; justify-content: flex-start; padding-bottom: 4px; }
+  .pagination button { flex: 0 0 44px; }
+  .metrics, .parts-kpis, .knowledge-kpis { grid-template-columns: 1fr 1fr; }
+  .knowledge-heading { align-items: stretch; flex-direction: column; }
+  .knowledge-search { width: 100%; min-width: 0; }
+  .knowledge-points { grid-template-columns: 1fr; }
+  .knowledge-card header { flex-direction: column; }
+  .garage-sidebar { max-height: 42dvh; }
+  .dialog,
+  .profiles-dialog,
+  .notifications-dialog,
+  .market-sample-dialog,
+  .details-dialog {
+    width: 100vw;
+    max-width: 100vw;
+    height: 100dvh;
+    max-height: 100dvh;
+    margin: 0;
+    padding: max(22px, env(safe-area-inset-top)) max(14px, env(safe-area-inset-right)) max(18px, env(safe-area-inset-bottom)) max(14px, env(safe-area-inset-left));
+    border: 0;
+    border-radius: 0;
+  }
+  .details-dialog { padding: 0; }
+  .dialog-close { position: sticky; top: 4px; z-index: 20; float: right; }
+  .detail-summary, .attributes div { grid-template-columns: 1fr; }
+  .profile-actions, .notification-rule-row > div:last-child { flex-wrap: wrap; }
+  .profile-actions button, .notification-rule-row > div:last-child button { flex: 1; }
+  .sample-aside button, .sample-aside a { min-height: 40px; display: inline-grid; place-items: center; }
+}
+
+@media (max-width: 420px) {
+  .filters, .advanced-filter-grid, .metrics, .parts-kpis,
+  .knowledge-kpis, .part-card-controls, .part-form,
+  .garage-add-form, .garage-entry-form, .garage-part-form {
+    grid-template-columns: 1fr;
+  }
+  .search-field { grid-column: auto; }
+  .market-sample-row { grid-template-columns: 72px minmax(0, 1fr); }
+  .sample-media { width: 72px; height: 58px; }
+  .sample-aside { grid-template-columns: 1fr; }
+  .carousel { height: 42dvh; min-height: 220px; }
+}

@@ -9,7 +9,10 @@ WORKDIR /app
 COPY pyproject.toml README.md main.py ./
 COPY src ./src
 
-RUN mkdir -p /data/images
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /data/images
 
 EXPOSE 8080
 

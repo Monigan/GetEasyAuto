@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import itertools
 import logging
+import shutil
+import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
@@ -508,6 +510,28 @@ class SearchService:
                     self._last_page_url = response.geturl()
             self.governor.record_success(request_kind)
         except HTTPError as error:
+            if (
+                error.code == 403
+                and self.source.name == "avito"
+                and shutil.which("curl") is not None
+            ):
+                logger.warning(
+                    "Avito отклонил Python HTTP-клиент (403); "
+                    "повтор через curl с тем же User-Agent"
+                )
+                if self.min_delay_seconds > 0:
+                    time.sleep(self.min_delay_seconds)
+                try:
+                    html = self._fetch_html_with_curl(
+                        url,
+                        headers=headers,
+                        request_kind=request_kind,
+                    )
+                except SourceError:
+                    logger.warning("Резервный запрос Avito через curl не удался")
+                    raise
+                self.governor.record_success(request_kind)
+                return html
             retry_after = _retry_after_seconds(error)
             if error.code in {429, 439}:
                 self.governor.record_rate_limit(
@@ -530,6 +554,77 @@ class SearchService:
             self._last_request_at = time.monotonic()
 
         return html
+
+    def _fetch_html_with_curl(
+        self,
+        url: str,
+        *,
+        headers: dict[str, str],
+        request_kind: str,
+    ) -> str:
+        marker = b"\n__AUTO_PARSER_CURL_STATUS__\t"
+        command = [
+            "curl",
+            "--silent",
+            "--show-error",
+            "--location",
+            "--compressed",
+            "--max-time",
+            str(max(1, round(self.timeout_seconds))),
+            "--user-agent",
+            headers["User-Agent"],
+        ]
+        for name in ("Accept", "Accept-Language", "Referer"):
+            if value := headers.get(name):
+                command.extend(("--header", f"{name}: {value}"))
+        command.extend(
+            (
+                "--write-out",
+                "\n__AUTO_PARSER_CURL_STATUS__\t%{http_code}\t%{url_effective}",
+                url,
+            )
+        )
+        assert self.governor is not None
+        try:
+            with self.governor.request(request_kind):
+                result = subprocess.run(
+                    command,
+                    check=False,
+                    capture_output=True,
+                    timeout=self.timeout_seconds + 5,
+                )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise SourceError(f"Ошибка резервного запроса через curl: {error}") from error
+
+        body, separator, metadata = result.stdout.rpartition(marker)
+        if not separator:
+            message = result.stderr.decode("utf-8", errors="replace").strip()
+            raise SourceError(
+                "curl не вернул сведения об HTTP-ответе"
+                + (f": {message}" if message else "")
+            )
+        fields = metadata.decode("utf-8", errors="replace").split("\t", 1)
+        try:
+            status = int(fields[0])
+        except (ValueError, IndexError) as error:
+            raise SourceError("curl вернул некорректный HTTP-код") from error
+        final_url = fields[1] if len(fields) > 1 else url
+        if status < 200 or status >= 300:
+            raise HttpSourceError(self.source.name, status)
+        if result.returncode != 0:
+            message = result.stderr.decode("utf-8", errors="replace").strip()
+            raise SourceError(
+                f"curl завершился с кодом {result.returncode}"
+                + (f": {message}" if message else "")
+            )
+        self._last_page_url = final_url
+        logger.info(
+            "HTTP %d через curl, получено %d байт, итоговый URL: %s",
+            status,
+            len(body),
+            _url_for_log(final_url),
+        )
+        return body.decode("utf-8", errors="replace")
 
     def _respect_delay(self) -> None:
         elapsed = time.monotonic() - self._last_request_at

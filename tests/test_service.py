@@ -1,9 +1,11 @@
 import hashlib
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
+from urllib.error import HTTPError
 
 from auto_parser.models import Listing
 from auto_parser.images import avito_image_identity
@@ -13,6 +15,43 @@ from auto_parser.sources.base import HttpSourceError
 
 
 class SearchPaginationTests(unittest.TestCase):
+    def test_avito_retries_urllib_403_via_curl(self) -> None:
+        service = SearchService(
+            AvitoSource(region="tver"),
+            check_robots=False,
+            min_delay_seconds=0,
+        )
+        forbidden = HTTPError(
+            "https://www.avito.ru/tver/avtomobili?cd=1",
+            403,
+            "Forbidden",
+            {},
+            None,
+        )
+        curl_result = subprocess.CompletedProcess(
+            args=["curl"],
+            returncode=0,
+            stdout=(
+                b"<html>allowed</html>\n"
+                b"__AUTO_PARSER_CURL_STATUS__\t200\t"
+                b"https://www.avito.ru/tver/avtomobili?cd=1"
+            ),
+            stderr=b"",
+        )
+
+        with patch.object(service._opener, "open", side_effect=forbidden), patch(
+            "auto_parser.service.shutil.which", return_value="/usr/bin/curl"
+        ), patch("auto_parser.service.subprocess.run", return_value=curl_result) as run:
+            html = service._fetch_html(
+                "https://www.avito.ru/tver/avtomobili?cd=1",
+                request_kind="search",
+            )
+
+        self.assertEqual(html, "<html>allowed</html>")
+        self.assertEqual(service._last_page_url, "https://www.avito.ru/tver/avtomobili?cd=1")
+        command = run.call_args.args[0]
+        self.assertIn("AutoListingsResearchBot/0.1", " ".join(command))
+
     def test_validation_preserves_sold_status_from_detail_page(self) -> None:
         service = SearchService(
             AvitoSource(region="tver"),
