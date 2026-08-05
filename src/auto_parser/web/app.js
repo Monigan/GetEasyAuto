@@ -2484,51 +2484,82 @@ function openDetails(item) {
   return loadGallery(item, token);
 }
 
-document.getElementById("detail-spare-parts-import").addEventListener(
-  "click",
-  async () => {
-    if (!currentDetailItem) return;
-    const button = document.getElementById("detail-spare-parts-import");
-    const root = document.getElementById("detail-spare-parts-state");
-    button.disabled = true;
-    root.replaceChildren();
-    const status = document.createElement("p");
-    status.textContent = "Определяем поколение и собираем тематические выдачи Drom…";
-    root.append(status);
-    try {
-      const response = await fetch("/api/spare-parts/import-for-car", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          source: currentDetailItem.source,
-          external_id: currentDetailItem.external_id,
-        }),
-      });
-      const payload = await response.json();
-      if (!response.ok && payload.verification_required) {
-        renderDetailSparePartsState(currentDetailItem.spare_parts, payload);
-        return;
+function announceDromVerification(payload) {
+  const message = payload.error
+    || "Drom запросил проверку «не робот». Откройте ссылку в карточке и пройдите её вручную.";
+  if ("Notification" in window && Notification.permission === "granted") {
+    const notification = new Notification("Требуется проверка Drom", {
+      body: message,
+      tag: "drom-verification-required",
+    });
+    notification.onclick = () => {
+      if (payload.verification_url) {
+        window.open(payload.verification_url, "_blank", "noopener");
       }
-      if (!response.ok) throw new Error(payload.error || "Не удалось собрать запчасти");
-      currentDetailItem.spare_parts = payload.spare_parts;
+    };
+  }
+  alert(`${message}\n\nСсылка для ручной проверки добавлена в карточку автомобиля.`);
+}
+
+async function importSparePartsForCurrentCar({ automatic = false } = {}) {
+  if (!currentDetailItem) return;
+  const item = currentDetailItem;
+  const button = document.getElementById("detail-spare-parts-import");
+  const root = document.getElementById("detail-spare-parts-state");
+  button.disabled = true;
+  root.replaceChildren();
+  const status = document.createElement("p");
+  status.textContent = automatic
+    ? "Анализ сохранён. Автоматически ищем запчасти и расходники для слабых мест…"
+    : "Определяем поколение и собираем тематические выдачи Drom…";
+  root.append(status);
+  try {
+    const response = await fetch("/api/spare-parts/import-for-car", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        source: item.source,
+        external_id: item.external_id,
+      }),
+    });
+    const payload = await response.json();
+    if (payload.verification_required && automatic) {
+      announceDromVerification(payload);
+    }
+    if (!response.ok && payload.verification_required) {
+      if (currentDetailItem === item) {
+        renderDetailSparePartsState(item.spare_parts, payload);
+      }
+      return;
+    }
+    if (!response.ok) throw new Error(payload.error || "Не удалось собрать запчасти");
+    item.spare_parts = payload.spare_parts;
+    if (currentDetailItem === item) {
       renderDetailSparePartsState(payload.spare_parts, payload);
       renderVehicleAnalysis(
-        currentDetailItem.vehicle_analysis,
-        currentDetailItem.listing_assessment,
+        item.vehicle_analysis,
+        item.listing_assessment,
         payload.spare_parts,
       );
-      state.listingsSignature = "";
-      state.sparePartsSignature = "";
-    } catch (error) {
+    }
+    state.listingsSignature = "";
+    state.sparePartsSignature = "";
+  } catch (error) {
+    if (currentDetailItem === item) {
       root.replaceChildren();
       const message = document.createElement("p");
       message.className = "is-error";
       message.textContent = error.message;
       root.append(message);
-    } finally {
-      button.disabled = false;
     }
-  },
+  } finally {
+    button.disabled = false;
+  }
+}
+
+document.getElementById("detail-spare-parts-import").addEventListener(
+  "click",
+  () => importSparePartsForCurrentCar(),
 );
 
 document.getElementById("vehicle-prompt-copy").addEventListener(
@@ -2598,6 +2629,9 @@ document.getElementById("vehicle-analysis-save").addEventListener(
       textarea.value = "";
       state.listingsSignature = "";
       state.knowledgeSignature = "";
+      if (payload.auto_spare_parts) {
+        await importSparePartsForCurrentCar({ automatic: true });
+      }
     } catch (error) {
       alert(error.message);
     } finally {

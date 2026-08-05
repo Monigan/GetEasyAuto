@@ -41,6 +41,7 @@ IMAGE_EXTENSIONS = {
     "image/gif": ".gif",
 }
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_HTML_BYTES = 20 * 1024 * 1024
 DEFAULT_SEARCH_LIMIT = 200
 DEFAULT_SEARCH_PAGES = 0
 _IMAGE_CACHE_LOCKS: dict[str, threading.Lock] = {}
@@ -477,7 +478,16 @@ class SearchService:
                     request,
                     timeout=self.timeout_seconds,
                 ) as response:
-                    body = response.read()
+                    content_length = response.headers.get("Content-Length")
+                    try:
+                        declared_size = int(content_length) if content_length else None
+                    except ValueError as error:
+                        raise SourceError("Некорректный размер HTML-ответа") from error
+                    if declared_size is not None and declared_size > MAX_HTML_BYTES:
+                        raise SourceError("HTML-ответ превышает лимит 20 МБ")
+                    body = response.read(MAX_HTML_BYTES + 1)
+                    if len(body) > MAX_HTML_BYTES:
+                        raise SourceError("HTML-ответ превышает лимит 20 МБ")
                     charset = (
                         response.headers.get_content_charset() or "utf-8"
                     )
@@ -571,6 +581,8 @@ class SearchService:
             "--compressed",
             "--max-time",
             str(max(1, round(self.timeout_seconds))),
+            "--max-filesize",
+            str(MAX_HTML_BYTES),
             "--user-agent",
             headers["User-Agent"],
         ]

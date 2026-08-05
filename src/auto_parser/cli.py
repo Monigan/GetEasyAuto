@@ -128,6 +128,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Порт веб-панели (по умолчанию 8080)",
     )
     parser.add_argument(
+        "--allow-remote-viewer",
+        action="store_true",
+        help="Явно разрешить веб-панели слушать нелокальный адрес",
+    )
+    parser.add_argument(
         "--scheduler",
         dest="scheduler",
         action="store_true",
@@ -193,6 +198,7 @@ def main(argv: list[str] | None = None) -> int:
                 cache_dir=args.cache_dir,
                 host=args.viewer_host,
                 port=args.viewer_port,
+                allow_remote=args.allow_remote_viewer,
             )
         except (OSError, ValueError) as error:
             print(f"Ошибка панели: {error}", file=sys.stderr)

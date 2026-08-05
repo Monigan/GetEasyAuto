@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -15,6 +16,16 @@ from auto_parser.images import (
     remap_cached_images,
 )
 from auto_parser.models import Listing
+
+
+_SCHEMA_LOCK = threading.Lock()
+_SCHEMA_READY: set[Path] = set()
+
+
+def configure_sqlite_connection(connection: sqlite3.Connection) -> None:
+    """Apply connection-local SQLite safety settings."""
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA busy_timeout = 10000")
 
 
 def _vehicle_key(value: str | None) -> str:
@@ -32,9 +43,20 @@ def _listing_year(listing: Listing) -> int | None:
 class ListingRepository:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
-        self.connection = sqlite3.connect(self.path)
+        self.connection = sqlite3.connect(self.path, timeout=10)
         self.connection.row_factory = sqlite3.Row
-        self._create_schema()
+        configure_sqlite_connection(self.connection)
+        schema_key = self.path.resolve()
+        with _SCHEMA_LOCK:
+            if schema_key not in _SCHEMA_READY:
+                self.connection.execute("PRAGMA journal_mode = WAL")
+                self._create_schema()
+                _SCHEMA_READY.add(schema_key)
+            else:
+                # Data migrations are guarded by their own metadata markers and
+                # remain retryable without rerunning the complete schema setup.
+                self._migrate_duplicate_image_variants()
+                self.connection.commit()
 
     def _create_schema(self) -> None:
         self.connection.executescript(
@@ -387,7 +409,9 @@ class ListingRepository:
                 external_id TEXT NOT NULL,
                 first_seen_at TEXT NOT NULL,
                 last_seen_at TEXT NOT NULL,
-                PRIMARY KEY (profile_id, source, external_id)
+                PRIMARY KEY (profile_id, source, external_id),
+                FOREIGN KEY(profile_id) REFERENCES search_profiles(id)
+                    ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS search_profile_listings_listing_idx
                 ON search_profile_listings(source, external_id, profile_id);
@@ -529,6 +553,36 @@ class ListingRepository:
             )
             """
         )
+        profile_listing_foreign_keys = self.connection.execute(
+            "PRAGMA foreign_key_list(search_profile_listings)"
+        ).fetchall()
+        if not any(row[3] == "profile_id" for row in profile_listing_foreign_keys):
+            self.connection.executescript(
+                """
+                CREATE TABLE search_profile_listings_v2 (
+                    profile_id INTEGER NOT NULL,
+                    source TEXT NOT NULL,
+                    external_id TEXT NOT NULL,
+                    first_seen_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL,
+                    PRIMARY KEY (profile_id, source, external_id),
+                    FOREIGN KEY(profile_id) REFERENCES search_profiles(id)
+                        ON DELETE CASCADE
+                );
+                INSERT INTO search_profile_listings_v2 (
+                    profile_id, source, external_id, first_seen_at, last_seen_at
+                )
+                SELECT spl.profile_id, spl.source, spl.external_id,
+                       spl.first_seen_at, spl.last_seen_at
+                FROM search_profile_listings spl
+                INNER JOIN search_profiles sp ON sp.id = spl.profile_id;
+                DROP TABLE search_profile_listings;
+                ALTER TABLE search_profile_listings_v2
+                    RENAME TO search_profile_listings;
+                CREATE INDEX search_profile_listings_listing_idx
+                    ON search_profile_listings(source, external_id, profile_id);
+                """
+            )
         self.connection.execute(
             "CREATE INDEX IF NOT EXISTS spare_part_offers_vehicle_idx "
             "ON spare_part_offers(brand_key, model_key, year_from, year_to)"

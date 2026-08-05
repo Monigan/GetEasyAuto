@@ -27,7 +27,7 @@ from auto_parser.spare_parts import (
     parse_drom_parts_index,
     parse_drom_parts_page,
 )
-from auto_parser.storage import ListingRepository
+from auto_parser.storage import ListingRepository, configure_sqlite_connection
 
 
 DEFAULT_SPARE_PART_SOURCES = (
@@ -35,6 +35,7 @@ DEFAULT_SPARE_PART_SOURCES = (
     "https://baza.drom.ru/sell_spare_parts/model/ford+mondeo/?autoPartsGeneration=2",
     "https://baza.drom.ru/sell_spare_parts/model/ford+mondeo/?autoPartsFuel=diesel&autoPartsGeneration=5&autoPartsVolume=1600",
 )
+MAX_DROM_HTML_BYTES = 20 * 1024 * 1024
 DROM_PART_CATEGORIES = (
     "Выхлопная система",
     "Двигатель и элементы двигателя",
@@ -101,8 +102,9 @@ def _drom_parts_page_url(url: str, page: int) -> str:
 
 @contextmanager
 def _database(path: Path) -> Iterator[sqlite3.Connection]:
-    connection = sqlite3.connect(path)
+    connection = sqlite3.connect(path, timeout=10)
     connection.row_factory = sqlite3.Row
+    configure_sqlite_connection(connection)
     try:
         yield connection
     finally:
@@ -131,7 +133,16 @@ class PartsApiMixin:
             final_url = urlparse(response.geturl())
             if final_url.hostname not in {"baza.drom.ru", "www.baza.drom.ru"}:
                 raise ValueError("Drom перенаправил запрос на неподдерживаемый сайт")
-            raw = response.read()
+            content_length = response.headers.get("Content-Length")
+            try:
+                declared_size = int(content_length) if content_length else None
+            except ValueError as error:
+                raise ValueError("Некорректный размер HTML-ответа Drom") from error
+            if declared_size is not None and declared_size > MAX_DROM_HTML_BYTES:
+                raise ValueError("HTML-ответ Drom превышает лимит 20 МБ")
+            raw = response.read(MAX_DROM_HTML_BYTES + 1)
+            if len(raw) > MAX_DROM_HTML_BYTES:
+                raise ValueError("HTML-ответ Drom превышает лимит 20 МБ")
             charset = response.headers.get_content_charset() or "utf-8"
         html = raw.decode(charset, errors="replace")
         if is_drom_verification_page(html, response.geturl()):

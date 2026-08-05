@@ -40,7 +40,7 @@ from auto_parser.sources import (
     source_name_from_url,
 )
 from auto_parser.sources.base import SourceError
-from auto_parser.storage import ListingRepository
+from auto_parser.storage import ListingRepository, configure_sqlite_connection
 
 
 WEB_ROOT = Path(__file__).with_name("web")
@@ -189,8 +189,9 @@ def _filters(
 
 @contextmanager
 def _open_database(path: Path) -> Iterator[sqlite3.Connection]:
-    connection = sqlite3.connect(path)
+    connection = sqlite3.connect(path, timeout=10)
     connection.row_factory = sqlite3.Row
+    configure_sqlite_connection(connection)
     try:
         yield connection
     finally:
@@ -880,6 +881,10 @@ class ViewerHandler(
                 "vehicle_analysis": saved,
                 "listing_assessment": saved_assessment,
                 "analysis_trim_name": trim_name,
+                "auto_spare_parts": bool(
+                    saved
+                    and (saved.get("data") or {}).get("weak_points")
+                ),
             }
         )
 
@@ -1786,7 +1791,13 @@ class ViewerHandler(
         except (json.JSONDecodeError, UnicodeDecodeError):
             self.send_error(HTTPStatus.BAD_REQUEST)
             return None
-        return payload if isinstance(payload, dict) else None
+        if not isinstance(payload, dict):
+            self._json(
+                {"error": "Ожидался JSON-объект"},
+                HTTPStatus.BAD_REQUEST,
+            )
+            return None
+        return payload
 
     def _search_profiles(self) -> None:
         with ListingRepository(self.database) as repository:
@@ -2305,7 +2316,12 @@ def serve(
     cache_dir: Path,
     host: str = "127.0.0.1",
     port: int = 8080,
+    allow_remote: bool = False,
 ) -> None:
+    if host not in {"127.0.0.1", "localhost", "::1"} and not allow_remote:
+        raise ValueError(
+            "Нелокальный адрес панели требует явного флага --allow-remote-viewer"
+        )
     if not database.is_file():
         raise FileNotFoundError(f"База объявлений не найдена: {database}")
     with ListingRepository(database):
@@ -2336,6 +2352,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--allow-remote", action="store_true")
     parser.add_argument(
         "--scheduler",
         dest="scheduler",
@@ -2365,6 +2382,7 @@ def main(argv: list[str] | None = None) -> int:
             cache_dir=args.cache_dir,
             host=args.host,
             port=args.port,
+            allow_remote=args.allow_remote,
         )
     finally:
         if scheduler:

@@ -21,5 +21,6 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 
 CMD ["python", "main.py", "--viewer", "--scheduler", \
      "--viewer-host", "0.0.0.0", "--viewer-port", "8080", \
+     "--allow-remote-viewer", \
      "--database", "/data/listings.db", "--cache-dir", "/data/images", \
      "--validation-interval", "60"]

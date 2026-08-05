@@ -11,6 +11,7 @@ from typing import Any, Iterator
 from urllib.parse import quote_plus
 
 from auto_parser.parts_api import PART_RECOMMENDATIONS, PART_TERMS
+from auto_parser.storage import configure_sqlite_connection
 
 
 def _now() -> str:
@@ -28,8 +29,9 @@ def _integer(value: Any, *, minimum: int = 0) -> int | None:
 
 @contextmanager
 def _database(path: Path) -> Iterator[sqlite3.Connection]:
-    connection = sqlite3.connect(path)
+    connection = sqlite3.connect(path, timeout=10)
     connection.row_factory = sqlite3.Row
+    configure_sqlite_connection(connection)
     try:
         yield connection
     finally:

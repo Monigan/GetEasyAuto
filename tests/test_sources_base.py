@@ -21,8 +21,8 @@ class _Response:
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         return None
 
-    def read(self) -> bytes:
-        return self.body
+    def read(self, amount: int | None = None) -> bytes:
+        return self.body if amount is None else self.body[:amount]
 
 
 class _Source(Source):

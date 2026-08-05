@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 import threading
+import time
 from urllib.parse import quote, unquote, urlparse, urlsplit
 from urllib.request import Request, urlopen
 from urllib.robotparser import RobotFileParser
@@ -10,7 +11,10 @@ from auto_parser.models import Listing
 
 
 _ROBOTS_CACHE: dict[str, RobotFileParser] = {}
+_ROBOTS_CACHE_TIME: dict[str, float] = {}
 _ROBOTS_CACHE_LOCK = threading.Lock()
+_ROBOTS_CACHE_TTL_SECONDS = 24 * 60 * 60
+_MAX_ROBOTS_BYTES = 1024 * 1024
 
 
 class SourceError(RuntimeError):
@@ -65,6 +69,9 @@ class Source(ABC):
         robots_url = self.robots_url()
         with _ROBOTS_CACHE_LOCK:
             robots = _ROBOTS_CACHE.get(robots_url)
+            loaded_at = _ROBOTS_CACHE_TIME.get(robots_url, 0.0)
+            if time.monotonic() - loaded_at > _ROBOTS_CACHE_TTL_SECONDS:
+                robots = None
         if robots is None:
             request = Request(
                 robots_url,
@@ -74,13 +81,17 @@ class Source(ABC):
                 },
             )
             with urlopen(request, timeout=15) as response:
-                body = response.read()
+                body = response.read(_MAX_ROBOTS_BYTES + 1)
+                if len(body) > _MAX_ROBOTS_BYTES:
+                    raise OSError("robots.txt превышает лимит 1 МБ")
                 charset = response.headers.get_content_charset() or "utf-8"
             loaded = RobotFileParser()
             loaded.set_url(robots_url)
             loaded.parse(body.decode(charset, errors="replace").splitlines())
             with _ROBOTS_CACHE_LOCK:
-                robots = _ROBOTS_CACHE.setdefault(robots_url, loaded)
+                _ROBOTS_CACHE[robots_url] = loaded
+                _ROBOTS_CACHE_TIME[robots_url] = time.monotonic()
+                robots = loaded
         return _can_fetch(robots, user_agent, url)
 
 

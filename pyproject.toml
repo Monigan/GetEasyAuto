@@ -4,11 +4,19 @@ build-backend = "hatchling.build"
 
 [project]
 name = "auto-listings-parser"
-version = "0.1.0"
+version = "0.1.5"
 description = "Keyword-based car listing collector"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
+
+[project.optional-dependencies]
+dev = [
+    "coverage>=7.6",
+    "mypy>=1.11",
+    "pytest>=8.3",
+    "ruff>=0.6",
+]
 
 [project.scripts]
 auto-parser = "auto_parser.cli:main"

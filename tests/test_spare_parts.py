@@ -6,9 +6,12 @@ import threading
 import unittest
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from auto_parser.models import Listing
+from auto_parser.parts_api import DromVerificationRequired
 from auto_parser.spare_parts import (
     build_drom_parts_url,
     generation_for_year,
@@ -49,6 +52,60 @@ SEARCH_HTML = """
 
 
 class SparePartsTest(unittest.TestCase):
+    def test_car_import_reports_drom_verification_to_the_client(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "test.db"
+            cache = root / "images"
+            cache.mkdir()
+            with ListingRepository(database) as repository:
+                repository.upsert_many([
+                    Listing(
+                        source="avito",
+                        external_id="verification-car",
+                        url="https://www.avito.ru/verification-car",
+                        title="Ford Mondeo, 2016",
+                        brand="Ford",
+                        model="Mondeo",
+                        attributes={"Год выпуска": "2016"},
+                    )
+                ])
+            handler = type(
+                "DromVerificationViewerHandler",
+                (ViewerHandler,),
+                {"database": database, "cache_dir": cache},
+            )
+            server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            verification_url = "https://baza.drom.ru/verify?u=parts"
+            request = Request(
+                f"http://127.0.0.1:{server.server_port}/api/spare-parts/import-for-car",
+                data=json.dumps({
+                    "source": "avito",
+                    "external_id": "verification-car",
+                }).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with patch.object(
+                    handler,
+                    "_download_spare_parts_html",
+                    side_effect=DromVerificationRequired(verification_url),
+                ):
+                    with self.assertRaises(HTTPError) as raised:
+                        urlopen(request, timeout=5)
+                    payload = json.load(raised.exception)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+        self.assertEqual(raised.exception.code, 429)
+        self.assertTrue(payload["verification_required"])
+        self.assertEqual(payload["verification_url"], verification_url)
+
     def test_links_cooling_fault_to_parts_without_matching_heater_actuator(self) -> None:
         analysis = normalize_vehicle_analysis_parts({"weak_points": [{
             "id": "coolant-leaks",

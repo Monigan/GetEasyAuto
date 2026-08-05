@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Iterator
 
 from auto_parser.sources.base import SourceError
+from auto_parser.storage import configure_sqlite_connection
 
 
 RATE_LIMIT_BASE_MINUTES = 15
@@ -310,7 +311,8 @@ class RequestGovernor:
     def _connect(self) -> sqlite3.Connection | None:
         if self.database is None:
             return None
-        connection = sqlite3.connect(self.database, timeout=2)
+        connection = sqlite3.connect(self.database, timeout=10)
+        configure_sqlite_connection(connection)
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS app_metadata (

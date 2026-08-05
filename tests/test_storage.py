@@ -675,6 +675,52 @@ class ListingRepositoryTests(unittest.TestCase):
             self.assertEqual(len(notifications), 1)
             self.assertEqual(notifications[0]["external_id"], "mail-1")
 
+    def test_sqlite_safety_settings_and_profile_cascade(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "test.db"
+            with ListingRepository(database) as repository:
+                self.assertEqual(
+                    repository.connection.execute(
+                        "PRAGMA foreign_keys"
+                    ).fetchone()[0],
+                    1,
+                )
+                self.assertEqual(
+                    repository.connection.execute(
+                        "PRAGMA journal_mode"
+                    ).fetchone()[0],
+                    "wal",
+                )
+                profile_id = repository.add_search_profile(
+                    query="Volvo XC90",
+                    region="all",
+                    radius=None,
+                    interval_minutes=60,
+                    created_at="2026-08-05T10:00:00+00:00",
+                )
+                repository.remember_search_profile_listings(
+                    profile_id,
+                    [
+                        Listing(
+                            source="avito",
+                            external_id="cascade",
+                            url="https://www.avito.ru/cascade",
+                            title="Volvo XC90",
+                        )
+                    ],
+                )
+                repository.connection.execute(
+                    "DELETE FROM search_profiles WHERE id = ?",
+                    (profile_id,),
+                )
+                repository.connection.commit()
+                remaining = repository.connection.execute(
+                    "SELECT COUNT(*) FROM search_profile_listings "
+                    "WHERE profile_id = ?",
+                    (profile_id,),
+                ).fetchone()[0]
+            self.assertEqual(remaining, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -8,6 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 from urllib.parse import urlencode
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from auto_parser.activity import (
@@ -65,6 +66,39 @@ class DeferredSearchService:
 
 
 class ViewerTests(unittest.TestCase):
+    def test_rejects_json_array_with_explicit_response(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "listings.db"
+            cache = root / "images"
+            cache.mkdir()
+            with ListingRepository(database):
+                pass
+            handler = type(
+                "InvalidJsonViewerHandler",
+                (ViewerHandler,),
+                {"database": database, "cache_dir": cache},
+            )
+            server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            request = Request(
+                f"http://127.0.0.1:{server.server_port}/api/vehicle-analysis",
+                data=b"[]",
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with self.assertRaises(HTTPError) as raised:
+                    urlopen(request, timeout=5)
+                payload = json.load(raised.exception)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+            self.assertEqual(raised.exception.code, 400)
+            self.assertEqual(payload["error"], "Ожидался JSON-объект")
+
     def test_listing_uses_drom_trim_fallback_date_and_saved_analysis(
         self,
     ) -> None:
@@ -182,6 +216,7 @@ class ViewerTests(unittest.TestCase):
         self.assertEqual(before["trim_options"][0]["name"], "316i MT")
         self.assertIn("drive2.ru/search", before["drive2_url"])
         self.assertTrue(saved["saved"])
+        self.assertTrue(saved["auto_spare_parts"])
         self.assertEqual(saved["analysis_trim_name"], "316i MT")
         self.assertEqual(after["analysis_trim_name"], "316i MT")
         self.assertEqual(
