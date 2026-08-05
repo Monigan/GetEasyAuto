@@ -27,7 +27,8 @@ from auto_parser.spare_parts import (
     parse_drom_parts_index,
     parse_drom_parts_page,
 )
-from auto_parser.storage import ListingRepository, configure_sqlite_connection
+from auto_parser.sqlite_support import configure_sqlite_connection
+from auto_parser.storage import ListingRepository
 
 
 DEFAULT_SPARE_PART_SOURCES = (

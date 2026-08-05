@@ -11,7 +11,7 @@ from typing import Any, Iterator
 from urllib.parse import quote_plus
 
 from auto_parser.parts_api import PART_RECOMMENDATIONS, PART_TERMS
-from auto_parser.storage import configure_sqlite_connection
+from auto_parser.sqlite_support import configure_sqlite_connection
 
 
 def _now() -> str:

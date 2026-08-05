@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Iterator
 
 from auto_parser.sources.base import SourceError
-from auto_parser.storage import configure_sqlite_connection
+from auto_parser.sqlite_support import configure_sqlite_connection
 
 
 RATE_LIMIT_BASE_MINUTES = 15

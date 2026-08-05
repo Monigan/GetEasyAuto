@@ -721,6 +721,44 @@ class ListingRepositoryTests(unittest.TestCase):
                 ).fetchone()[0]
             self.assertEqual(remaining, 0)
 
+    def test_backs_up_legacy_database_before_schema_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "legacy.db"
+            connection = sqlite3.connect(database)
+            connection.execute(
+                "CREATE TABLE legacy_marker (value TEXT NOT NULL)"
+            )
+            connection.execute(
+                "INSERT INTO legacy_marker (value) VALUES ('preserved')"
+            )
+            connection.commit()
+            connection.close()
+
+            with ListingRepository(database) as repository:
+                version = repository.connection.execute(
+                    "PRAGMA user_version"
+                ).fetchone()[0]
+            backups = list(root.glob("legacy.backup-v0-to-v1-*.sqlite3"))
+
+            self.assertEqual(version, 1)
+            self.assertEqual(len(backups), 1)
+            backup = sqlite3.connect(backups[0])
+            try:
+                preserved = backup.execute(
+                    "SELECT value FROM legacy_marker"
+                ).fetchone()[0]
+            finally:
+                backup.close()
+            self.assertEqual(preserved, "preserved")
+
+            with ListingRepository(database):
+                pass
+            self.assertEqual(
+                len(list(root.glob("legacy.backup-v0-to-v1-*.sqlite3"))),
+                1,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

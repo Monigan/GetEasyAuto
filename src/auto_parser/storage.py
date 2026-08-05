@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-import threading
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -16,16 +15,12 @@ from auto_parser.images import (
     remap_cached_images,
 )
 from auto_parser.models import Listing
-
-
-_SCHEMA_LOCK = threading.Lock()
-_SCHEMA_READY: set[Path] = set()
-
-
-def configure_sqlite_connection(connection: sqlite3.Connection) -> None:
-    """Apply connection-local SQLite safety settings."""
-    connection.execute("PRAGMA foreign_keys = ON")
-    connection.execute("PRAGMA busy_timeout = 10000")
+from auto_parser.sqlite_support import (
+    configure_sqlite_connection,
+    finish_schema_migration,
+    prepare_schema_migration,
+    schema_initialization,
+)
 
 
 def _vehicle_key(value: str | None) -> str:
@@ -46,12 +41,12 @@ class ListingRepository:
         self.connection = sqlite3.connect(self.path, timeout=10)
         self.connection.row_factory = sqlite3.Row
         configure_sqlite_connection(self.connection)
-        schema_key = self.path.resolve()
-        with _SCHEMA_LOCK:
-            if schema_key not in _SCHEMA_READY:
+        with schema_initialization(self.path) as initialize_schema:
+            if initialize_schema:
                 self.connection.execute("PRAGMA journal_mode = WAL")
+                prepare_schema_migration(self.connection, self.path)
                 self._create_schema()
-                _SCHEMA_READY.add(schema_key)
+                finish_schema_migration(self.connection)
             else:
                 # Data migrations are guarded by their own metadata markers and
                 # remain retryable without rerunning the complete schema setup.
@@ -1266,16 +1261,37 @@ class ListingRepository:
         ).fetchall()
         return [dict(row) for row in rows]
 
-    def vehicle_analyses(self) -> list[dict[str, Any]]:
+    def vehicle_analyses(
+        self,
+        *,
+        search: str = "",
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        conditions = ["trim_key != ''"]
+        values: list[Any] = []
+        if search.strip():
+            conditions.append(
+                "(brand LIKE ? OR model LIKE ? OR trim_name LIKE ? "
+                "OR analysis_json LIKE ?)"
+            )
+            pattern = f"%{search.strip()}%"
+            values.extend([pattern] * 4)
+        pagination = ""
+        if limit is not None:
+            pagination = " LIMIT ? OFFSET ?"
+            values.extend([max(1, min(limit, 100)), max(0, offset)])
         rows = self.connection.execute(
-            """
+            f"""
             SELECT brand, model, trim_name,
                    analysis_json, updated_at
             FROM vehicle_analyses
-            WHERE trim_key != ''
+            WHERE {' AND '.join(conditions)}
             ORDER BY brand COLLATE NOCASE, model COLLATE NOCASE,
                      trim_name COLLATE NOCASE
-            """
+            {pagination}
+            """,
+            values,
         ).fetchall()
         result = []
         for row in rows:
@@ -1293,6 +1309,16 @@ class ListingRepository:
                 }
             )
         return result
+
+    def vehicle_analyses_summary(self, *, search: str = "") -> dict[str, int]:
+        items = self.vehicle_analyses(search=search)
+        return {
+            "vehicle_groups": len(items),
+            "weak_points": sum(
+                len(item["analysis"].get("weak_points") or [])
+                for item in items
+            ),
+        }
 
     def listing_trim_assignment(
         self,

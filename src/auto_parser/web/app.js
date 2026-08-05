@@ -11,6 +11,8 @@ const state = {
   knowledgeSignature: "",
   sparePartsSignature: "",
   sparePartsPage: 1,
+  knowledgePage: 1,
+  soldPage: 1,
   sparePartsCategory: "",
   knowledgePayload: null,
   refreshRunning: false,
@@ -1235,6 +1237,11 @@ function renderSold(payload) {
     row.append(info, price);
     root.append(row);
   }
+  renderSectionPagination("sold-pagination", payload, (page) => {
+    state.soldPage = page;
+    refresh().catch(showError);
+    document.getElementById("sold-view").scrollIntoView({ behavior: "smooth" });
+  });
 }
 
 document.getElementById("analysis-open-sample").addEventListener(
@@ -1372,6 +1379,29 @@ function renderSpareParts(payload) {
   }
 }
 
+function renderSectionPagination(elementId, payload, onChange) {
+  const nav = document.getElementById(elementId);
+  nav.replaceChildren();
+  const pages = payload.pages || 0;
+  const current = payload.page || 1;
+  if (pages <= 1) return;
+  const numbers = [...new Set([
+    1,
+    Math.max(1, current - 1),
+    current,
+    Math.min(pages, current + 1),
+    pages,
+  ])].sort((left, right) => left - right);
+  for (const page of numbers) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = page;
+    button.className = page === current ? "active" : "";
+    button.addEventListener("click", () => onChange(page));
+    nav.append(button);
+  }
+}
+
 function refreshSparePartsFromFirstPage() {
   state.sparePartsPage = 1;
   state.sparePartsSignature = "";
@@ -1467,7 +1497,13 @@ async function refresh() {
       return;
     }
     if (state.view === "knowledge") {
-      const response = await fetch("/api/vehicle-analyses");
+      const query = new URLSearchParams({
+        page: String(state.knowledgePage),
+        page_size: "20",
+      });
+      const search = document.getElementById("knowledge-search").value.trim();
+      if (search) query.set("q", search);
+      const response = await fetch(`/api/vehicle-analyses?${query}`);
       if (!response.ok) throw new Error("Не удалось загрузить базу слабых мест");
       const payload = await response.json();
       const signature = JSON.stringify(payload);
@@ -1510,7 +1546,10 @@ async function refresh() {
       return;
     }
     if (state.view === "sold") {
-      const response = await fetch(`/api/sold?${params(false)}`);
+      const query = params(false);
+      query.set("page", state.soldPage);
+      query.set("page_size", "30");
+      const response = await fetch(`/api/sold?${query}`);
       if (!response.ok) throw new Error("Не удалось загрузить архив продаж");
       renderSold(await response.json());
       return;
@@ -1576,6 +1615,7 @@ function scheduleAutoRefresh(delay = autoRefreshDelay()) {
 let timer;
 function scheduleRefresh() {
   state.page = 1;
+  state.soldPage = 1;
   savePreferences();
   clearTimeout(timer);
   timer = setTimeout(() => refresh().catch(showError), 250);
@@ -1617,6 +1657,8 @@ function switchView(view, shouldRefresh = true) {
   state.view = view;
   if (view !== "catalog") reportDisplayedListings([], true);
   state.page = 1;
+  if (view === "knowledge") state.knowledgePage = 1;
+  if (view === "sold") state.soldPage = 1;
   document.getElementById("catalog-view").hidden = view !== "catalog";
   document.getElementById("analytics-view").hidden = view !== "analytics";
   document.getElementById("knowledge-view").hidden = view !== "knowledge";
@@ -1660,7 +1702,12 @@ for (const button of document.querySelectorAll(".nav-button")) {
 
 document.getElementById("knowledge-search").addEventListener(
   "input",
-  () => renderKnowledge(),
+  () => {
+    state.knowledgePage = 1;
+    state.knowledgeSignature = "";
+    clearTimeout(timer);
+    timer = setTimeout(() => refresh().catch(showError), 250);
+  },
 );
 
 for (const element of Object.values(elements)) {
@@ -2247,6 +2294,12 @@ function renderKnowledge(payload = state.knowledgePayload) {
     card.append(points);
     root.append(card);
   }
+  renderSectionPagination("knowledge-pagination", payload, (page) => {
+    state.knowledgePage = page;
+    state.knowledgeSignature = "";
+    refresh().catch(showError);
+    document.getElementById("knowledge-view").scrollIntoView({ behavior: "smooth" });
+  });
 }
 
 function vehicleAnalysisPrompt(item) {

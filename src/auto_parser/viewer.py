@@ -10,14 +10,14 @@ import sqlite3
 import statistics
 import time
 from collections import Counter, defaultdict
-from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 from urllib.parse import parse_qs, quote_plus, urlparse
 
+from auto_parser import __version__
 from auto_parser.activity import (
     clear_listing_activity,
     listing_activities,
@@ -40,162 +40,23 @@ from auto_parser.sources import (
     source_name_from_url,
 )
 from auto_parser.sources.base import SourceError
-from auto_parser.storage import ListingRepository, configure_sqlite_connection
+from auto_parser.sqlite_support import SCHEMA_VERSION
+from auto_parser.storage import ListingRepository
+from auto_parser.viewer_query import (
+    ATTRIBUTE_FILTERS,
+    SORTS,
+    build_filters as _filters,
+    integer as _integer,
+    open_database as _open_database,
+)
+from auto_parser.viewer_security import (
+    authorize_request,
+    resolve_password,
+    validate_remote_access,
+)
 
 
 WEB_ROOT = Path(__file__).with_name("web")
-POWER_EXPRESSION = (
-    "CASE WHEN json_valid(l.attributes_json) "
-    "THEN CAST(json_extract(l.attributes_json, '$.\"Мощность\"') AS INTEGER) "
-    "END"
-)
-SORTS = {
-    "newest": "last_seen_at DESC",
-    "recently_updated": "last_seen_at DESC",
-    "recently_added": "first_seen_at DESC",
-    "price_asc": "price IS NULL, price ASC",
-    "price_desc": "price IS NULL, price DESC",
-    "mileage_asc": "mileage_km IS NULL, mileage_km ASC",
-    "mileage_desc": "mileage_km IS NULL, mileage_km DESC",
-    "power_asc": f"{POWER_EXPRESSION} IS NULL, {POWER_EXPRESSION} ASC",
-    "power_desc": f"{POWER_EXPRESSION} IS NULL, {POWER_EXPRESSION} DESC",
-}
-ATTRIBUTE_FILTERS = {
-    "year": "Год выпуска",
-    "fuel": "Тип двигателя",
-    "engine_volume": "Объём двигателя",
-    "transmission": "Коробка передач",
-    "drive": "Привод",
-    "body": "Тип кузова",
-    "color": "Цвет",
-    "owners": "Владельцев по ПТС",
-    "pts": "ПТС",
-    "condition": "Состояние",
-}
-def _integer(value: str | None, *, minimum: int = 0) -> int | None:
-    if value in {None, ""}:
-        return None
-    try:
-        return max(minimum, int(value))
-    except ValueError:
-        return None
-
-
-def _filters(
-    query: dict[str, list[str]],
-    *,
-    apply_visibility: bool = False,
-    default_status: str | None = None,
-) -> tuple[str, list[Any]]:
-    conditions: list[str] = []
-    values: list[Any] = []
-    source_hidden = False
-    profile_id = _integer(query.get("profile_id", [None])[0])
-    if profile_id is not None and profile_id > 0:
-        conditions.append(
-            "EXISTS ("
-            "SELECT 1 FROM search_profile_listings spl "
-            "WHERE spl.profile_id = ? "
-            "AND spl.source = l.source "
-            "AND spl.external_id = l.external_id"
-            ")"
-        )
-        values.append(profile_id)
-    if apply_visibility:
-        visibility = query.get("visibility", ["visible"])[0].strip()
-        if visibility == "source_hidden":
-            conditions.append("l.status = 'hidden'")
-            source_hidden = True
-        elif visibility == "hidden":
-            conditions.append("l.hidden = 1")
-        elif visibility != "all":
-            conditions.append("l.hidden = 0")
-    mapping = (
-        ("min_price", "l.price >= ?"),
-        ("max_price", "l.price <= ?"),
-        ("min_mileage", "l.mileage_km >= ?"),
-        ("max_mileage", "l.mileage_km <= ?"),
-    )
-    for name, expression in mapping:
-        value = _integer(query.get(name, [None])[0])
-        if value is not None:
-            conditions.append(expression)
-            values.append(value)
-
-    location = query.get("location", [""])[0].strip()
-    if location:
-        conditions.append("l.location = ?")
-        values.append(location)
-
-    brand = query.get("brand", [""])[0].strip()
-    if brand:
-        conditions.append("l.brand = ?")
-        values.append(brand)
-
-    model = query.get("model", [""])[0].strip()
-    if model:
-        conditions.append("l.model = ?")
-        values.append(model)
-
-    source = query.get("source", [""])[0].strip()
-    external_id = query.get("external_id", [""])[0].strip()
-    if source:
-        conditions.append("l.source = ?")
-        values.append(source)
-    if external_id:
-        conditions.append("l.external_id = ?")
-        values.append(external_id)
-
-    first_seen_date = query.get("first_seen_date", [""])[0].strip()
-    if first_seen_date:
-        conditions.append("substr(l.first_seen_at, 1, 10) = ?")
-        values.append(first_seen_date)
-
-    status = query.get("status", [""])[0].strip()
-    if status:
-        conditions.append("l.status = ?")
-        values.append(status)
-    elif default_status and not source_hidden:
-        conditions.append("l.status = ?")
-        values.append(default_status)
-
-    for parameter, attribute_name in ATTRIBUTE_FILTERS.items():
-        selected = [
-            value.strip()
-            for value in query.get(parameter, [])
-            if value.strip()
-        ]
-        if not selected:
-            continue
-        placeholders = ", ".join("?" for _ in selected)
-        conditions.append(
-            "CASE WHEN json_valid(l.attributes_json) "
-            "THEN json_extract(l.attributes_json, ?) "
-            f"END IN ({placeholders})"
-        )
-        values.append(f'$."{attribute_name}"')
-        values.extend(selected)
-
-    search = query.get("q", [""])[0].strip().casefold()
-    if search:
-        conditions.append(
-            "(LOWER(l.title) LIKE ? OR LOWER(COALESCE(l.description, '')) LIKE ?)"
-        )
-        pattern = f"%{search}%"
-        values.extend((pattern, pattern))
-
-    return (" WHERE " + " AND ".join(conditions) if conditions else ""), values
-
-
-@contextmanager
-def _open_database(path: Path) -> Iterator[sqlite3.Connection]:
-    connection = sqlite3.connect(path, timeout=10)
-    connection.row_factory = sqlite3.Row
-    configure_sqlite_connection(connection)
-    try:
-        yield connection
-    finally:
-        connection.close()
 
 
 def _histogram(
@@ -329,6 +190,7 @@ class ViewerHandler(
 ):
     database: Path
     cache_dir: Path
+    viewer_password: str | None = None
 
     def handle(self) -> None:
         try:
@@ -368,7 +230,15 @@ class ViewerHandler(
             return
         print(f"[viewer] {self.address_string()} - {message}")
 
+    def end_headers(self) -> None:
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        super().end_headers()
+
     def do_GET(self) -> None:
+        if not authorize_request(self, self.viewer_password):
+            return
         parsed = urlparse(self.path)
         if self._garage_get_route(parsed.path):
             return
@@ -391,7 +261,7 @@ class ViewerHandler(
         elif parsed.path == "/api/search-profiles":
             self._search_profiles()
         elif parsed.path == "/api/vehicle-analyses":
-            self._vehicle_analyses()
+            self._vehicle_analyses(parse_qs(parsed.query))
         elif parsed.path == "/api/parts/cars":
             self._parts_cars()
         elif parsed.path == "/api/parts":
@@ -404,6 +274,8 @@ class ViewerHandler(
             self._static(parsed.path)
 
     def do_POST(self) -> None:
+        if not authorize_request(self, self.viewer_password):
+            return
         parsed = urlparse(self.path)
         if self._garage_post_route(parsed.path):
             return
@@ -454,6 +326,8 @@ class ViewerHandler(
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_PATCH(self) -> None:
+        if not authorize_request(self, self.viewer_password):
+            return
         path = urlparse(self.path).path
         if self._garage_patch_route(path):
             return
@@ -483,6 +357,8 @@ class ViewerHandler(
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_DELETE(self) -> None:
+        if not authorize_request(self, self.viewer_password):
+            return
         path = urlparse(self.path).path
         if self._garage_delete_route(path):
             return
@@ -888,19 +764,29 @@ class ViewerHandler(
             }
         )
 
-    def _vehicle_analyses(self) -> None:
+    def _vehicle_analyses(self, query: dict[str, list[str]]) -> None:
+        page = _integer(query.get("page", ["1"])[0], minimum=1) or 1
+        page_size = min(
+            _integer(query.get("page_size", ["20"])[0], minimum=1) or 20,
+            100,
+        )
+        search = str(query.get("q", [""])[0]).strip()
         with ListingRepository(self.database) as repository:
-            items = repository.vehicle_analyses()
+            summary = repository.vehicle_analyses_summary(search=search)
+            items = repository.vehicle_analyses(
+                search=search,
+                limit=page_size,
+                offset=(page - 1) * page_size,
+            )
         self._json(
             {
                 "items": items,
-                "summary": {
-                    "vehicle_groups": len(items),
-                    "weak_points": sum(
-                        len(item["analysis"].get("weak_points") or [])
-                        for item in items
-                    ),
-                },
+                "summary": summary,
+                "page": page,
+                "page_size": page_size,
+                "pages": math.ceil(summary["vehicle_groups"] / page_size)
+                if summary["vehicle_groups"]
+                else 0,
             }
         )
 
@@ -1497,17 +1383,32 @@ class ViewerHandler(
     def _sold(self, query: dict[str, list[str]]) -> None:
         sold_query = dict(query)
         sold_query.pop("status", None)
+        sold_query.pop("page", None)
+        sold_query.pop("page_size", None)
         where, values = _filters(sold_query, default_status="sold")
+        page = _integer(query.get("page", ["1"])[0], minimum=1) or 1
+        page_size = min(
+            _integer(query.get("page_size", ["30"])[0], minimum=1) or 30,
+            100,
+        )
         with _open_database(self.database) as connection:
+            summary_rows = connection.execute(
+                f"""
+                SELECT l.source, l.sold_price, l.price, l.first_seen_at,
+                       l.sold_at, l.last_seen_at
+                FROM listings l{where}
+                """,
+                values,
+            ).fetchall()
             rows = connection.execute(
                 f"""
                 SELECT l.* FROM listings l{where}
                 ORDER BY COALESCE(l.sold_at, l.last_seen_at) DESC
+                LIMIT ? OFFSET ?
                 """,
-                values,
+                [*values, page_size, (page - 1) * page_size],
             ).fetchall()
         items = []
-        days = []
         for row in rows:
             item = dict(row)
             item["sold_price"] = item["sold_price"] or item["price"]
@@ -1521,32 +1422,56 @@ class ViewerHandler(
                     )
                 )
                 item["days_on_market"] = max(0, (finished - started).days)
-                days.append(item["days_on_market"])
             except (AttributeError, TypeError, ValueError):
                 item["days_on_market"] = None
             item.pop("attributes_json", None)
             items.append(item)
-        prices = [item["sold_price"] for item in items if item["sold_price"]]
-        source_counts = Counter(item["source"] for item in items)
+        summary_prices = [
+            row["sold_price"] or row["price"]
+            for row in summary_rows
+            if row["sold_price"] or row["price"]
+        ]
+        summary_days = []
+        for row in summary_rows:
+            try:
+                started = datetime.fromisoformat(
+                    row["first_seen_at"].replace("Z", "+00:00")
+                )
+                finished = datetime.fromisoformat(
+                    (row["sold_at"] or row["last_seen_at"]).replace(
+                        "Z", "+00:00"
+                    )
+                )
+                summary_days.append(max(0, (finished - started).days))
+            except (AttributeError, TypeError, ValueError):
+                pass
+        source_counts = Counter(row["source"] for row in summary_rows)
+        total = len(summary_rows)
         self._json(
             {
                 "items": items,
                 "summary": {
-                    "count": len(items),
+                    "count": total,
                     "median_price": (
-                        round(statistics.median(prices)) if prices else None
+                        round(statistics.median(summary_prices))
+                        if summary_prices else None
                     ),
                     "average_price": (
-                        round(statistics.fmean(prices)) if prices else None
+                        round(statistics.fmean(summary_prices))
+                        if summary_prices else None
                     ),
                     "median_days_on_market": (
-                        round(statistics.median(days)) if days else None
+                        round(statistics.median(summary_days))
+                        if summary_days else None
                     ),
                     "sources": [
                         {"label": source, "value": count}
                         for source, count in source_counts.most_common()
                     ],
                 },
+                "page": page,
+                "page_size": page_size,
+                "pages": math.ceil(total / page_size) if total else 0,
             }
         )
 
@@ -1765,6 +1690,8 @@ class ViewerHandler(
 
         self._json(
             {
+                "app_version": __version__,
+                "schema_version": SCHEMA_VERSION,
                 "locations": locations,
                 "brands": brands,
                 "sources": sources,
@@ -2317,7 +2244,14 @@ def serve(
     host: str = "127.0.0.1",
     port: int = 8080,
     allow_remote: bool = False,
+    password: str | None = None,
 ) -> None:
+    password = resolve_password(password)
+    validate_remote_access(
+        host,
+        allow_remote=allow_remote,
+        password=password,
+    )
     if host not in {"127.0.0.1", "localhost", "::1"} and not allow_remote:
         raise ValueError(
             "Нелокальный адрес панели требует явного флага --allow-remote-viewer"
@@ -2329,7 +2263,11 @@ def serve(
     handler = type(
         "ConfiguredViewerHandler",
         (ViewerHandler,),
-        {"database": database.resolve(), "cache_dir": cache_dir.resolve()},
+        {
+            "database": database.resolve(),
+            "cache_dir": cache_dir.resolve(),
+            "viewer_password": password,
+        },
     )
     server = ThreadingHTTPServer((host, port), handler)
     print(f"Панель объявлений: http://{host}:{port}")
@@ -2353,6 +2291,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--allow-remote", action="store_true")
+    parser.add_argument("--password", help="Пароль веб-панели")
     parser.add_argument(
         "--scheduler",
         dest="scheduler",
@@ -2383,6 +2322,7 @@ def main(argv: list[str] | None = None) -> int:
             host=args.host,
             port=args.port,
             allow_remote=args.allow_remote,
+            password=args.password,
         )
     finally:
         if scheduler:
