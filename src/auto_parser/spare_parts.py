@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from copy import deepcopy
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from typing import Any
@@ -522,23 +523,111 @@ def parse_drom_parts_page(html: str, page_url: str) -> list[SparePartOffer]:
     return offers
 
 
-def offer_matches_terms(offer: dict[str, Any], terms: list[str]) -> bool:
+_PART_LINK_RULES: tuple[tuple[tuple[str, ...], dict[str, Any]], ...] = (
+    (("помп", "водян насос", "насос охлажда"), {
+        "part_type": "water_pump",
+        "search_terms": ["помпа", "водяная помпа", "водяной насос", "насос охлаждающей жидкости"],
+        "exclude_terms": ["печка", "заслонка", "сервопривод", "омыватель", "топливный насос"],
+    }),
+    (("термостат",), {
+        "part_type": "thermostat",
+        "search_terms": ["термостат"],
+        "exclude_terms": ["печка", "заслонка", "сервопривод"],
+    }),
+    (("патруб", "шланг охлажда"), {
+        "part_type": "coolant_hose",
+        "search_terms": ["патрубок охлаждения", "патрубок радиатора", "шланг охлаждения", "патрубок"],
+        "exclude_terms": ["тормозной шланг", "топливный шланг", "воздушный патрубок"],
+    }),
+    (("радиатор",), {
+        "part_type": "radiator",
+        "search_terms": ["радиатор охлаждения", "радиатор двигателя", "радиатор"],
+        "exclude_terms": ["радиатор печки", "радиатор кондиционера"],
+    }),
+)
+
+
+def _repair_part_from_name(name: str) -> dict[str, Any]:
+    cleaned = " ".join(str(name).split())
+    normalized = cleaned.casefold().replace("ё", "е")
+    result: dict[str, Any] = {
+        "name": cleaned,
+        "part_type": "other",
+        "search_terms": [cleaned],
+        "exclude_terms": [],
+    }
+    for hints, values in _PART_LINK_RULES:
+        if any(hint in normalized for hint in hints):
+            result.update(deepcopy(values))
+            break
+    return result
+
+
+def normalize_vehicle_analysis_parts(analysis: dict[str, Any]) -> dict[str, Any]:
+    """Add explicit repair-part links while preserving the public JSON shape."""
+    normalized_analysis = deepcopy(analysis)
+    for point in normalized_analysis.get("weak_points") or []:
+        if not isinstance(point, dict):
+            continue
+        raw_parts = point.get("repair_parts")
+        if not isinstance(raw_parts, list) or not raw_parts:
+            raw_parts = point.get("replacement_parts") or point.get("parts") or []
+        if isinstance(raw_parts, (str, dict)):
+            raw_parts = [raw_parts]
+        repair_parts: list[dict[str, Any]] = []
+        for raw_part in raw_parts:
+            if isinstance(raw_part, str):
+                part = _repair_part_from_name(raw_part)
+            elif isinstance(raw_part, dict):
+                part = _repair_part_from_name(str(raw_part.get("name") or ""))
+                for key in ("part_type", "category", "search_terms", "exclude_terms"):
+                    if raw_part.get(key) is not None and raw_part.get(key) != "":
+                        part[key] = deepcopy(raw_part[key])
+            else:
+                continue
+            if not part["name"]:
+                continue
+            for key in ("search_terms", "exclude_terms"):
+                values = part.get(key) or []
+                if isinstance(values, str):
+                    values = [values]
+                part[key] = list(dict.fromkeys(
+                    " ".join(str(value).split()) for value in values if str(value).strip()
+                ))
+            repair_parts.append(part)
+        point["repair_parts"] = repair_parts
+        point["replacement_parts"] = [part["name"] for part in repair_parts]
+        point["repair_context"] = {
+            "system": point.get("system"),
+            "fault_type": point.get("fault_type"),
+            "matching_policy": "part_name_required",
+        }
+    return normalized_analysis
+
+
+def _term_matches_haystack(term: str, haystack: str) -> bool:
+    tokens = [
+        normalize_vehicle(token)
+        for token in re.findall(r"[a-zа-яё0-9]{3,}", term.casefold())
+    ]
+    if not tokens:
+        return False
+    stems = [token if len(token) <= 6 else token[:max(5, len(token) - 2)] for token in tokens]
+    return all(token in haystack or stem in haystack for token, stem in zip(tokens, stems))
+
+
+def offer_matches_repair_part(offer: dict[str, Any], repair_part: dict[str, Any]) -> bool:
     haystack = normalize_vehicle(" ".join(filter(None, (
         offer.get("category"), offer.get("subcategory"),
         offer.get("name"), offer.get("description"),
     ))))
-    for term in terms:
-        tokens = [normalize_vehicle(token) for token in re.findall(r"[a-zа-яё0-9]{3,}", term.casefold())]
-        stems = [
-            token if len(token) <= 6 else token[:max(5, len(token) - 2)]
-            for token in tokens
-        ]
-        if tokens and any(
-            token in haystack or stem in haystack
-            for token, stem in zip(tokens, stems)
-        ):
-            return True
-    return False
+    if any(
+        _term_matches_haystack(str(term), haystack)
+        for term in repair_part.get("exclude_terms") or []
+    ):
+        return False
+    terms = repair_part.get("search_terms") or [repair_part.get("name")]
+    return any(_term_matches_haystack(str(term), haystack) for term in terms if term)
 
 
 def listing_spare_parts_payload(
@@ -568,7 +657,9 @@ def listing_spare_parts_payload(
             year=item.get("year"),
             generation=generation,
         )
-    analysis = (item.get("vehicle_analysis") or {}).get("data") or {}
+    analysis = normalize_vehicle_analysis_parts(
+        (item.get("vehicle_analysis") or {}).get("data") or {}
+    )
     assessment = (item.get("listing_assessment") or {}).get("data") or {}
     excluded = set(assessment.get("excluded_weak_point_ids") or [])
     relevant = set(assessment.get("relevant_weak_point_ids") or [])
@@ -583,18 +674,29 @@ def listing_spare_parts_payload(
             continue
         if relevant and point_id and point_id not in relevant:
             continue
-        replacement_parts = point.get("replacement_parts") or point.get("parts") or []
-        if isinstance(replacement_parts, str):
-            replacement_parts = [replacement_parts]
-        terms = [str(value) for value in replacement_parts]
-        terms.extend(str(point.get(key) or "") for key in ("issue", "system"))
-        matched = [offer for offer in offers if offer_matches_terms(offer, terms)][:3]
+        repair_parts = point.get("repair_parts") or []
+        matched: list[dict[str, Any]] = []
+        selected_ids: list[int] = []
+        for repair_part in repair_parts:
+            part_matches = [
+                {**offer, "matched_repair_part": repair_part.get("name")}
+                for offer in offers
+                if offer_matches_repair_part(offer, repair_part)
+            ][:3]
+            matched.extend(
+                offer for offer in part_matches
+                if offer["id"] not in {existing["id"] for existing in matched}
+            )
+            chosen_part = next(
+                (offer for offer in part_matches if offer.get("price") is not None),
+                part_matches[0] if part_matches else None,
+            )
+            if chosen_part and chosen_part["id"] not in chosen_ids:
+                chosen_ids.add(chosen_part["id"])
+                selected_ids.append(chosen_part["id"])
+                parts_total += chosen_part.get("price") or 0
         if not matched:
             continue
-        chosen = next((offer for offer in matched if offer.get("price") is not None), matched[0])
-        if chosen["id"] not in chosen_ids:
-            chosen_ids.add(chosen["id"])
-            parts_total += chosen.get("price") or 0
         point_labor_min = int(point.get("labor_cost_min") or 0)
         point_labor_max = int(point.get("labor_cost_max") or point_labor_min)
         labor_min += point_labor_min
@@ -603,7 +705,9 @@ def listing_spare_parts_payload(
             "weak_point_id": point_id,
             "title": " — ".join(filter(None, (point.get("system"), point.get("issue")))) or "Слабое место",
             "offers": matched,
-            "selected_offer_id": chosen["id"],
+            "selected_offer_id": selected_ids[0] if selected_ids else None,
+            "selected_offer_ids": selected_ids,
+            "repair_parts": repair_parts,
         })
     estimated = assessment.get("parts_investment_total") or analysis.get("estimated_initial_investment") or {}
     estimated_min = int(estimated.get("min") or 0) if isinstance(estimated, dict) else 0

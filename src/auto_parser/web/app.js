@@ -1990,7 +1990,8 @@ function renderVehicleAnalysis(vehicleAnalysis, listingAssessment = null, spareP
       offers.className = "analysis-part-offers";
       for (const offer of marketMatch.offers) {
         const link = document.createElement("a");
-        link.className = `analysis-part-offer${offer.id === marketMatch.selected_offer_id ? " is-selected" : ""}`;
+        const selectedOfferIds = marketMatch.selected_offer_ids || [marketMatch.selected_offer_id];
+        link.className = `analysis-part-offer${selectedOfferIds.includes(offer.id) ? " is-selected" : ""}`;
         link.href = offer.source_url;
         link.target = "_blank";
         link.rel = "noopener noreferrer";
@@ -2005,7 +2006,10 @@ function renderVehicleAnalysis(vehicleAnalysis, listingAssessment = null, spareP
         const name = document.createElement("strong");
         name.textContent = offer.name;
         const seller = document.createElement("small");
-        seller.textContent = [formatMoney(offer.price), offer.seller || "Drom"].join(" · ");
+        seller.textContent = [
+          offer.matched_repair_part && `Для замены: ${offer.matched_repair_part}`,
+          formatMoney(offer.price), offer.seller || "Drom",
+        ].filter(Boolean).join(" · ");
         copy.append(name, seller);
         link.append(copy);
         offers.append(link);
@@ -2262,7 +2266,15 @@ function vehicleAnalysisPrompt(item) {
 1. model_analysis — полный справочник всех типовых слабых мест именно этой модели и комплектации. Не удаляй из него неисправности из-за заявлений продавца: этот блок будет общим только для автомобилей с той же маркой, моделью и комплектацией.
 2. listing_assessment — оценка только этого объявления на основе текста продавца. Если в описании прямо сказано, что узел заменён или обслужен, добавь его ID в excluded_weak_point_ids, чтобы проблема не показывалась в этой карточке. Не считай расплывчатые фразы вроде «всё обслужено» подтверждением конкретного ТО.
 
-Указывай стоимость запчастей и работ раздельно в рублях. В replacement_parts перечисляй конкретные названия деталей, по которым можно найти товарное предложение (например, «термостат», «водяная помпа»). Не выдумывай точность: давай реалистичные диапазоны.
+Указывай стоимость запчастей и работ раздельно в рублях. Для каждой неисправности обязательно заполняй repair_parts — связанный список конкретных компонентов, которые действительно устраняют именно эту неисправность. Не используй в качестве поисковых терминов общие слова «система», «охлаждение», «двигатель», «ремонт» или название симптома.
+
+Для каждой детали укажи:
+- name — понятное название детали;
+- part_type — короткий стабильный тип латиницей (например water_pump, thermostat, coolant_hose);
+- search_terms — точные названия и реальные синонимы только этой детали;
+- exclude_terms — названия соседних, но неподходящих деталей, которые нельзя предлагать.
+
+Пример для течи системы охлаждения: водяная помпа должна находиться по «помпа», «водяная помпа», «водяной насос», но не по словам «система охлаждения»; сервопривод заслонок печки, насос омывателя и топливный насос должны быть исключены. В replacement_parts продублируй только значения name для обратной совместимости. Не выдумывай точность: давай реалистичные диапазоны.
 
 Верни только валидный JSON без Markdown по схеме:
 {
@@ -2280,7 +2292,15 @@ function vehicleAnalysisPrompt(item) {
         "parts_cost_max": 0,
         "labor_cost_min": 0,
         "labor_cost_max": 0,
-        "replacement_parts": ["название детали для поиска в базе"],
+        "repair_parts": [
+          {
+            "name": "водяная помпа",
+            "part_type": "water_pump",
+            "search_terms": ["помпа", "водяная помпа", "водяной насос", "насос охлаждающей жидкости"],
+            "exclude_terms": ["сервопривод заслонок", "насос печки", "насос омывателя", "топливный насос"]
+          }
+        ],
+        "replacement_parts": ["водяная помпа"],
         "priority": "high|medium|low"
       }
     ],

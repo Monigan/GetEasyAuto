@@ -16,6 +16,8 @@ from auto_parser.spare_parts import (
     known_drom_generation,
     listing_spare_parts_payload,
     nested_categories_for_analysis,
+    normalize_vehicle_analysis_parts,
+    offer_matches_repair_part,
     parse_drom_part_description,
     parse_drom_parts_index,
     parse_drom_parts_page,
@@ -47,6 +49,31 @@ SEARCH_HTML = """
 
 
 class SparePartsTest(unittest.TestCase):
+    def test_links_cooling_fault_to_parts_without_matching_heater_actuator(self) -> None:
+        analysis = normalize_vehicle_analysis_parts({"weak_points": [{
+            "id": "coolant-leaks",
+            "system": "Система охлаждения",
+            "issue": "Течи из-за водяного насоса, термостата и патрубков",
+            "replacement_parts": ["водяная помпа", "термостат", "патрубки охлаждения"],
+        }]})
+        parts = analysis["weak_points"][0]["repair_parts"]
+        actuator = {
+            "category": "Система отопления и кондиционирования",
+            "subcategory": "заслонки печки",
+            "name": "Сервопривод заслонок печки BMW 7-Series 6911819 E65",
+            "description": "Привод климатической установки",
+        }
+        pump = {
+            "category": "Двигатель и элементы двигателя",
+            "subcategory": "система охлаждения",
+            "name": "Водяная помпа BMW 7-Series E65 N62",
+            "description": "Насос охлаждающей жидкости",
+        }
+
+        self.assertEqual(parts[0]["part_type"], "water_pump")
+        self.assertTrue(offer_matches_repair_part(pump, parts[0]))
+        self.assertFalse(any(offer_matches_repair_part(actuator, part) for part in parts))
+
     def test_builds_automatic_tag_links_and_discovers_generation(self) -> None:
         index = parse_drom_parts_index("""
         <a href="/sell_spare_parts/model/ford+mondeo/?autoPartsGeneration=4">4 поколение 2007 – 2015</a>

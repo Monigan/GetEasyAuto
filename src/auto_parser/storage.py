@@ -561,7 +561,29 @@ class ListingRepository:
             """
         )
         self._migrate_duplicate_image_variants()
+        self._migrate_vehicle_analysis_repair_links()
         self.connection.commit()
+
+    def _migrate_vehicle_analysis_repair_links(self) -> None:
+        from auto_parser.spare_parts import normalize_vehicle_analysis_parts
+
+        rows = self.connection.execute(
+            "SELECT id, analysis_json FROM vehicle_analyses"
+        ).fetchall()
+        for row in rows:
+            try:
+                analysis = json.loads(row["analysis_json"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(analysis, dict):
+                continue
+            normalized = normalize_vehicle_analysis_parts(analysis)
+            encoded = json.dumps(normalized, ensure_ascii=False)
+            if encoded != row["analysis_json"]:
+                self.connection.execute(
+                    "UPDATE vehicle_analyses SET analysis_json = ? WHERE id = ?",
+                    (encoded, row["id"]),
+                )
 
     def _migrate_duplicate_image_variants(self) -> None:
         migration_key = "deduplicate_avito_image_variants_v2"
@@ -910,6 +932,9 @@ class ListingRepository:
         *,
         updated_at: str,
     ) -> None:
+        from auto_parser.spare_parts import normalize_vehicle_analysis_parts
+
+        analysis = normalize_vehicle_analysis_parts(analysis)
         brand_key = _vehicle_key(brand)
         model_key = _vehicle_key(model)
         trim_key = _vehicle_key(trim_name)
