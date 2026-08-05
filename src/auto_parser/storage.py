@@ -172,6 +172,32 @@ class ListingRepository:
                 updated_at TEXT NOT NULL,
                 UNIQUE(car_source, car_external_id, name, seller)
             );
+            CREATE TABLE IF NOT EXISTS spare_part_offers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL,
+                external_id TEXT NOT NULL,
+                source_url TEXT NOT NULL,
+                source_list_url TEXT,
+                brand TEXT NOT NULL,
+                model TEXT NOT NULL,
+                brand_key TEXT NOT NULL,
+                model_key TEXT NOT NULL,
+                generation INTEGER,
+                year_from INTEGER,
+                year_to INTEGER,
+                fuel TEXT,
+                engine_volume_cc INTEGER,
+                category TEXT,
+                subcategory TEXT,
+                name TEXT NOT NULL,
+                description TEXT,
+                price INTEGER,
+                image_url TEXT,
+                seller TEXT,
+                location TEXT,
+                observed_at TEXT NOT NULL,
+                UNIQUE(source, external_id)
+            );
             CREATE TABLE IF NOT EXISTS garage_cars (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 listing_source TEXT,
@@ -503,6 +529,26 @@ class ListingRepository:
             )
             """
         )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS spare_part_offers_vehicle_idx "
+            "ON spare_part_offers(brand_key, model_key, year_from, year_to)"
+        )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS spare_part_offers_price_idx "
+            "ON spare_part_offers(brand_key, model_key, price)"
+        )
+        spare_offer_columns = {
+            row["name"]
+            for row in self.connection.execute("PRAGMA table_info(spare_part_offers)")
+        }
+        if "category" not in spare_offer_columns:
+            self.connection.execute(
+                "ALTER TABLE spare_part_offers ADD COLUMN category TEXT"
+            )
+        if "subcategory" not in spare_offer_columns:
+            self.connection.execute(
+                "ALTER TABLE spare_part_offers ADD COLUMN subcategory TEXT"
+            )
         self.connection.execute(
             """
             UPDATE listings
@@ -894,6 +940,252 @@ class ListingRepository:
             ),
         )
         self.connection.commit()
+
+    def upsert_spare_part_offers(
+        self,
+        offers: Iterable[Any],
+        *,
+        source_list_url: str,
+        observed_at: str,
+    ) -> int:
+        saved = 0
+        for offer in offers:
+            values = {
+                name: getattr(offer, name)
+                for name in (
+                    "source", "external_id", "source_url", "brand", "model",
+                    "generation", "year_from", "year_to", "fuel",
+                    "engine_volume_cc", "category", "subcategory", "name", "description", "price",
+                    "image_url", "seller", "location",
+                )
+            }
+            self.connection.execute(
+                """
+                INSERT INTO spare_part_offers (
+                    source, external_id, source_url, source_list_url,
+                    brand, model, brand_key, model_key, generation,
+                    year_from, year_to, fuel, engine_volume_cc, category, subcategory, name,
+                    description, price, image_url, seller, location, observed_at
+                ) VALUES (
+                    :source, :external_id, :source_url, :source_list_url,
+                    :brand, :model, :brand_key, :model_key, :generation,
+                    :year_from, :year_to, :fuel, :engine_volume_cc, :category, :subcategory, :name,
+                    :description, :price, :image_url, :seller, :location, :observed_at
+                )
+                ON CONFLICT(source, external_id) DO UPDATE SET
+                    source_url = excluded.source_url,
+                    source_list_url = excluded.source_list_url,
+                    brand = excluded.brand,
+                    model = excluded.model,
+                    brand_key = excluded.brand_key,
+                    model_key = excluded.model_key,
+                    generation = excluded.generation,
+                    year_from = excluded.year_from,
+                    year_to = excluded.year_to,
+                    fuel = excluded.fuel,
+                    engine_volume_cc = excluded.engine_volume_cc,
+                    category = COALESCE(excluded.category, spare_part_offers.category),
+                    subcategory = COALESCE(excluded.subcategory, spare_part_offers.subcategory),
+                    name = excluded.name,
+                    description = COALESCE(excluded.description, spare_part_offers.description),
+                    price = excluded.price,
+                    image_url = COALESCE(excluded.image_url, spare_part_offers.image_url),
+                    seller = excluded.seller,
+                    location = excluded.location,
+                    observed_at = excluded.observed_at
+                """,
+                {
+                    **values,
+                    "source_list_url": source_list_url,
+                    "brand_key": _vehicle_key(values["brand"]),
+                    "model_key": _vehicle_key(values["model"]),
+                    "observed_at": observed_at,
+                },
+            )
+            saved += 1
+        self.connection.commit()
+        return saved
+
+    def spare_part_offers(
+        self,
+        *,
+        brand: str | None = None,
+        model: str | None = None,
+        category: str | None = None,
+        search: str | None = None,
+        priced_only: bool = False,
+        generation: int | None = None,
+        min_price: int | None = None,
+        max_price: int | None = None,
+        offset: int = 0,
+        sort: str = "price_asc",
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        conditions, values = self._spare_part_filters(
+            brand=brand, model=model, category=category, search=search,
+            priced_only=priced_only, generation=generation,
+            min_price=min_price, max_price=max_price,
+        )
+        where = "WHERE " + " AND ".join(conditions) if conditions else ""
+        order_by = {
+            "price_desc": "price IS NULL, price DESC, observed_at DESC",
+            "newest": "observed_at DESC, price IS NULL, price",
+            "name": "name COLLATE NOCASE, price IS NULL, price",
+        }.get(sort, "price IS NULL, price, observed_at DESC")
+        rows = self.connection.execute(
+            f"""
+            SELECT * FROM spare_part_offers
+            {where}
+            ORDER BY {order_by}
+            LIMIT ? OFFSET ?
+            """,
+            [*values, max(1, min(limit, 500)), max(0, offset)],
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def spare_part_offer_summary(
+        self,
+        *,
+        brand: str | None = None,
+        model: str | None = None,
+        category: str | None = None,
+        search: str | None = None,
+        priced_only: bool = False,
+        generation: int | None = None,
+        min_price: int | None = None,
+        max_price: int | None = None,
+    ) -> dict[str, Any]:
+        conditions, values = self._spare_part_filters(
+            brand=brand, model=model, category=category, search=search,
+            priced_only=priced_only, generation=generation,
+            min_price=min_price, max_price=max_price,
+        )
+        where = "WHERE " + " AND ".join(conditions) if conditions else ""
+        row = self.connection.execute(
+            f"""
+            SELECT COUNT(*) AS offers_count,
+                   SUM(price IS NOT NULL) AS priced_count,
+                   MIN(price) AS min_price,
+                   MAX(price) AS max_price
+            FROM spare_part_offers {where}
+            """,
+            values,
+        ).fetchone()
+        return dict(row) if row else {
+            "offers_count": 0, "priced_count": 0,
+            "min_price": None, "max_price": None,
+        }
+
+    def spare_part_facets(self) -> dict[str, list[dict[str, Any]]]:
+        categories = self.connection.execute(
+            """
+            SELECT COALESCE(category, 'Без категории') AS value, COUNT(*) AS count
+            FROM spare_part_offers
+            GROUP BY COALESCE(category, 'Без категории')
+            ORDER BY count DESC, value COLLATE NOCASE
+            """
+        ).fetchall()
+        generations = self.connection.execute(
+            """
+            SELECT generation AS value, COUNT(*) AS count
+            FROM spare_part_offers WHERE generation IS NOT NULL
+            GROUP BY generation ORDER BY generation
+            """
+        ).fetchall()
+        return {
+            "categories": [dict(row) for row in categories],
+            "generations": [dict(row) for row in generations],
+        }
+
+    @staticmethod
+    def _spare_part_filters(
+        *,
+        brand: str | None,
+        model: str | None,
+        category: str | None,
+        search: str | None,
+        priced_only: bool,
+        generation: int | None,
+        min_price: int | None,
+        max_price: int | None,
+    ) -> tuple[list[str], list[Any]]:
+        conditions: list[str] = []
+        values: list[Any] = []
+        if brand:
+            conditions.append("brand_key = ?")
+            values.append(_vehicle_key(brand))
+        if model:
+            conditions.append("model_key = ?")
+            values.append(_vehicle_key(model))
+        if category:
+            if category == "Без категории":
+                conditions.append("category IS NULL")
+            else:
+                conditions.append("category = ?")
+                values.append(category)
+        if search:
+            conditions.append(
+                "(name LIKE ? OR description LIKE ? OR subcategory LIKE ? "
+                "OR seller LIKE ? OR location LIKE ?)"
+            )
+            pattern = f"%{search}%"
+            values.extend([pattern] * 5)
+        if priced_only:
+            conditions.append("price IS NOT NULL")
+        if generation is not None:
+            conditions.append("generation = ?")
+            values.append(generation)
+        if min_price is not None:
+            conditions.append("price >= ?")
+            values.append(min_price)
+        if max_price is not None:
+            conditions.append("price <= ?")
+            values.append(max_price)
+        return conditions, values
+
+    def matching_spare_part_offers(
+        self,
+        brand: str | None,
+        model: str | None,
+        *,
+        year: int | None = None,
+        fuel: str | None = None,
+        engine_volume: str | None = None,
+        generation: int | None = None,
+        limit: int = 300,
+    ) -> list[dict[str, Any]]:
+        if not brand or not model:
+            return []
+        conditions = ["brand_key = ?", "model_key = ?"]
+        values: list[Any] = [_vehicle_key(brand), _vehicle_key(model)]
+        if generation is not None:
+            conditions.append("(generation IS NULL OR generation = ?)")
+            values.append(generation)
+        if year:
+            conditions.append("(year_from IS NULL OR year_from <= ?)")
+            conditions.append("(year_to IS NULL OR year_to >= ?)")
+            values.extend((year, year))
+        normalized_fuel = str(fuel or "").casefold()
+        if normalized_fuel:
+            fuel_key = "diesel" if "диз" in normalized_fuel else "gasoline" if "бенз" in normalized_fuel else None
+            if fuel_key:
+                conditions.append("(fuel IS NULL OR fuel = ?)")
+                values.append(fuel_key)
+        volume_match = re.search(r"(\d+(?:[.,]\d+)?)", str(engine_volume or ""))
+        if volume_match:
+            volume_cc = round(float(volume_match.group(1).replace(",", ".")) * 1000)
+            conditions.append("(engine_volume_cc IS NULL OR ABS(engine_volume_cc - ?) <= 100)")
+            values.append(volume_cc)
+        rows = self.connection.execute(
+            f"""
+            SELECT * FROM spare_part_offers
+            WHERE {' AND '.join(conditions)}
+            ORDER BY price IS NULL, price, observed_at DESC
+            LIMIT ?
+            """,
+            [*values, max(1, min(limit, 500))],
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def vehicle_analyses(self) -> list[dict[str, Any]]:
         rows = self.connection.execute(

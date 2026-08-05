@@ -9,6 +9,9 @@ const state = {
   statsSignature: "",
   marketSignature: "",
   knowledgeSignature: "",
+  sparePartsSignature: "",
+  sparePartsPage: 1,
+  sparePartsCategory: "",
   knowledgePayload: null,
   refreshRunning: false,
   refreshPending: false,
@@ -47,6 +50,19 @@ function displayedListingsClientId() {
 }
 
 const displayedClientId = displayedListingsClientId();
+
+function configureDromBookmarklet() {
+  const link = document.getElementById("spare-parts-bookmarklet");
+  const target = `${globalThis.location.origin}/capture.html`;
+  const origin = globalThis.location.origin;
+  const pageCount = Number(document.getElementById("spare-parts-import-pages")?.value || 3);
+  const code = `(async function(){const target=${JSON.stringify(target)},origin=${JSON.stringify(origin)},pageCount=${pageCount};if(location.hostname!=="baza.drom.ru"&&location.hostname!=="www.baza.drom.ru"){alert("Откройте страницу списка запчастей Drom и нажмите закладку там.");return}const popup=open(target,"autoscope_capture","width=560,height=420");if(!popup){alert("Разрешите всплывающее окно для импорта в AutoScope.");return}const pages=[{url:location.href,html:document.documentElement.outerHTML}];const base=new URL(location.href);base.pathname=base.pathname.replace(/\\/page\\d+\\/?$/,"/");for(let page=2;page<=pageCount;page++){const next=new URL(base.href);next.pathname=next.pathname.replace(/\\/$/,"")+"/page"+page+"/";try{const response=await fetch(next.href,{credentials:"include"});const html=await response.text();if(!response.ok||/Вы не робот|подозрительный трафик|\\/verify\\?/i.test(html))break;pages.push({url:next.href,html});await new Promise(resolve=>setTimeout(resolve,1200))}catch(error){break}}let sent=false;const receive=function(event){if(event.origin!==origin)return;if(event.data&&event.data.type==="autoscope-ready"&&!sent){sent=true;popup.postMessage({type:"autoscope-capture",url:location.href,html:pages[0].html,pages},origin)}if(event.data&&(event.data.type==="autoscope-import-complete"||event.data.type==="autoscope-import-error")){alert(event.data.message);removeEventListener("message",receive)}};addEventListener("message",receive)})();`;
+  link.href = `javascript:${code}`;
+  link.title = "Перетащите эту кнопку в панель закладок браузера";
+}
+
+configureDromBookmarklet();
+document.getElementById("spare-parts-import-pages")?.addEventListener("change", configureDromBookmarklet);
 
 function reportDisplayedListings(items, force = false) {
   const displayed = (items || []).slice(0, 100).map((item) => ({
@@ -1229,6 +1245,204 @@ document.getElementById("analysis-export").addEventListener("click", () => {
   window.location.assign(`/api/export-analysis?${params(false)}`);
 });
 
+function renderSpareParts(payload) {
+  const { items = [], vehicles = [], sources = [], summary = {}, facets = {} } = payload;
+  setText("spare-parts-count", money.format(summary.offers_count || 0));
+  setText("spare-parts-priced", money.format(summary.priced_count || 0));
+  setText("spare-parts-models", money.format(summary.models_count || 0));
+  const sourceList = document.getElementById("spare-parts-sources");
+  sourceList.replaceChildren(...sources.map((url) => new Option(url, url)));
+  const vehicleSelect = document.getElementById("spare-parts-vehicle");
+  const selected = vehicleSelect.value;
+  vehicleSelect.replaceChildren(new Option("Все модели", ""));
+  for (const vehicle of vehicles) {
+    vehicleSelect.append(new Option(
+      `${vehicle.brand} ${vehicle.model} · ${money.format(vehicle.offers_count)}`,
+      `${vehicle.brand}|${vehicle.model}`,
+    ));
+  }
+  vehicleSelect.value = [...vehicleSelect.options].some((option) => option.value === selected) ? selected : "";
+
+  const generationSelect = document.getElementById("spare-parts-generation");
+  const selectedGeneration = generationSelect.value;
+  generationSelect.replaceChildren(new Option("Все", ""));
+  for (const entry of facets.generations || []) {
+    generationSelect.append(new Option(`${entry.value} · ${money.format(entry.count)}`, entry.value));
+  }
+  generationSelect.value = [...generationSelect.options].some((option) => option.value === selectedGeneration)
+    ? selectedGeneration : "";
+
+  const tabs = document.getElementById("spare-parts-tabs");
+  tabs.replaceChildren();
+  const categoryItems = [
+    { value: "", count: vehicles.reduce((total, vehicle) => total + vehicle.offers_count, 0), label: "Все" },
+    ...(facets.categories || []).map((entry) => ({ ...entry, label: entry.value })),
+  ];
+  for (const entry of categoryItems) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `spare-parts-tab${state.sparePartsCategory === entry.value ? " is-active" : ""}`;
+    button.setAttribute("role", "tab");
+    button.setAttribute("aria-selected", state.sparePartsCategory === entry.value ? "true" : "false");
+    button.append(document.createTextNode(entry.label));
+    const count = document.createElement("small");
+    count.textContent = money.format(entry.count || 0);
+    button.append(count);
+    button.addEventListener("click", () => {
+      state.sparePartsCategory = entry.value;
+      state.sparePartsPage = 1;
+      state.sparePartsSignature = "";
+      refresh().catch(showError);
+    });
+    tabs.append(button);
+  }
+
+  setText(
+    "spare-parts-result-caption",
+    `Найдено ${money.format(summary.offers_count || 0)} · страница ${payload.page || 1} из ${payload.pages || 1}`,
+  );
+  const pagination = document.getElementById("spare-parts-pagination");
+  pagination.replaceChildren();
+  const totalPages = payload.pages || 1;
+  const currentPage = payload.page || 1;
+  const pageNumbers = [...new Set([
+    1,
+    Math.max(1, currentPage - 1),
+    currentPage,
+    Math.min(totalPages, currentPage + 1),
+    totalPages,
+  ])].sort((a, b) => a - b);
+  for (const pageNumber of pageNumbers) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = pageNumber;
+    button.className = pageNumber === currentPage ? "is-active" : "";
+    button.addEventListener("click", () => {
+      state.sparePartsPage = pageNumber;
+      state.sparePartsSignature = "";
+      refresh().catch(showError);
+    });
+    pagination.append(button);
+  }
+  const root = document.getElementById("spare-parts-list");
+  root.replaceChildren();
+  document.getElementById("spare-parts-empty").hidden = items.length > 0;
+  for (const part of items) {
+    const article = document.createElement("article");
+    article.className = "spare-part-card";
+    const media = document.createElement("div");
+    media.className = "spare-part-media";
+    if (part.image_url) {
+      const image = document.createElement("img");
+      image.src = part.image_url;
+      image.alt = part.name;
+      image.loading = "lazy";
+      media.append(image);
+    } else {
+      media.textContent = "Нет фото";
+    }
+    const content = document.createElement("div");
+    content.className = "spare-part-content";
+    const meta = document.createElement("small");
+    meta.textContent = [
+      `${part.brand} ${part.model}`,
+      part.category,
+      part.subcategory,
+      part.generation && `${part.generation} поколение`,
+      part.year_from && `${part.year_from}–${part.year_to || "…"}`,
+      part.location,
+    ].filter(Boolean).join(" · ");
+    const title = document.createElement("h3");
+    title.textContent = part.name;
+    const description = document.createElement("p");
+    description.textContent = part.description || "Описание продавца не указано";
+    const footer = document.createElement("div");
+    footer.className = "spare-part-footer";
+    const price = document.createElement("strong");
+    price.textContent = formatMoney(part.price);
+    const link = document.createElement("a");
+    link.href = part.source_url;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.textContent = part.seller ? `${part.seller} ↗` : "Открыть на Drom ↗";
+    footer.append(price, link);
+    content.append(meta, title, description, footer);
+    article.append(media, content);
+    root.append(article);
+  }
+}
+
+function refreshSparePartsFromFirstPage() {
+  state.sparePartsPage = 1;
+  state.sparePartsSignature = "";
+  refresh().catch(showError);
+}
+
+for (const id of [
+  "spare-parts-vehicle", "spare-parts-generation", "spare-parts-sort",
+  "spare-parts-priced-only", "spare-parts-min-price", "spare-parts-max-price",
+]) {
+  document.getElementById(id).addEventListener("change", refreshSparePartsFromFirstPage);
+}
+let sparePartsSearchTimer;
+document.getElementById("spare-parts-search").addEventListener("input", () => {
+  clearTimeout(sparePartsSearchTimer);
+  sparePartsSearchTimer = setTimeout(refreshSparePartsFromFirstPage, 250);
+});
+document.getElementById("spare-parts-reset").addEventListener("click", () => {
+  state.sparePartsCategory = "";
+  for (const id of [
+    "spare-parts-search", "spare-parts-vehicle", "spare-parts-generation",
+    "spare-parts-min-price", "spare-parts-max-price",
+  ]) document.getElementById(id).value = "";
+  document.getElementById("spare-parts-sort").value = "price_asc";
+  document.getElementById("spare-parts-priced-only").checked = false;
+  refreshSparePartsFromFirstPage();
+});
+
+document.getElementById("spare-parts-import").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = event.currentTarget.querySelector("button[type=submit]");
+  const status = document.getElementById("spare-parts-import-state");
+  button.disabled = true;
+  status.textContent = "Получаем список товаров…";
+  try {
+    const response = await fetch("/api/spare-parts/import", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        url: event.currentTarget.elements.url.value,
+        pages: Number(event.currentTarget.elements.pages.value || 1),
+        load_descriptions: false,
+      }),
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      status.replaceChildren(document.createTextNode(payload.error || "Не удалось импортировать запчасти"));
+      if (payload.verification_url) {
+        const link = document.createElement("a");
+        link.href = payload.verification_url;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        link.textContent = " Пройти проверку вручную ↗";
+        status.append(link);
+      }
+      return;
+    }
+    status.textContent = [
+      `Добавлено или обновлено: ${money.format(payload.imported)} · ${payload.brand} ${payload.model}${payload.pages_imported ? ` · страниц: ${payload.pages_imported}` : ""}`,
+      payload.category,
+      payload.subcategory,
+    ].filter(Boolean).join(" · ");
+    state.sparePartsSignature = "";
+    await refresh();
+  } catch (error) {
+    status.textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+});
+
 async function refresh() {
   if (state.refreshRunning) {
     state.refreshPending = true;
@@ -1260,6 +1474,38 @@ async function refresh() {
       if (signature !== state.knowledgeSignature) {
         state.knowledgeSignature = signature;
         renderKnowledge(payload);
+      }
+      return;
+    }
+    if (state.view === "spare-parts") {
+      const selected = document.getElementById("spare-parts-vehicle").value;
+      const query = new URLSearchParams();
+      if (selected) {
+        const [brand, model] = selected.split("|");
+        query.set("brand", brand);
+        query.set("model", model);
+      }
+      const filterValues = {
+        search: document.getElementById("spare-parts-search").value.trim(),
+        generation: document.getElementById("spare-parts-generation").value,
+        min_price: document.getElementById("spare-parts-min-price").value,
+        max_price: document.getElementById("spare-parts-max-price").value,
+        sort: document.getElementById("spare-parts-sort").value,
+      };
+      for (const [key, value] of Object.entries(filterValues)) {
+        if (value) query.set(key, value);
+      }
+      if (state.sparePartsCategory) query.set("category", state.sparePartsCategory);
+      if (document.getElementById("spare-parts-priced-only").checked) query.set("priced", "1");
+      query.set("page", state.sparePartsPage);
+      query.set("limit", "60");
+      const response = await fetch(`/api/spare-parts?${query}`);
+      if (!response.ok) throw new Error("Не удалось загрузить базу запчастей");
+      const payload = await response.json();
+      const signature = JSON.stringify(payload);
+      if (signature !== state.sparePartsSignature) {
+        state.sparePartsSignature = signature;
+        renderSpareParts(payload);
       }
       return;
     }
@@ -1350,6 +1596,11 @@ function showError(error) {
     root.replaceChildren(emptyNote(`Ошибка загрузки базы: ${error.message}`));
     return;
   }
+  if (state.view === "spare-parts") {
+    const root = document.getElementById("spare-parts-list");
+    root.replaceChildren(emptyNote(`Ошибка загрузки запчастей: ${error.message}`));
+    return;
+  }
   if (state.view === "sold") {
     const root = document.getElementById("sold-list");
     root.replaceChildren(emptyNote(`Ошибка загрузки архива: ${error.message}`));
@@ -1362,16 +1613,17 @@ function showError(error) {
 }
 
 function switchView(view, shouldRefresh = true) {
-  if (!["catalog", "analytics", "knowledge", "sold", "garage"].includes(view) || state.view === view) return;
+  if (!["catalog", "analytics", "knowledge", "spare-parts", "sold", "garage"].includes(view) || state.view === view) return;
   state.view = view;
   if (view !== "catalog") reportDisplayedListings([], true);
   state.page = 1;
   document.getElementById("catalog-view").hidden = view !== "catalog";
   document.getElementById("analytics-view").hidden = view !== "analytics";
   document.getElementById("knowledge-view").hidden = view !== "knowledge";
+  document.getElementById("spare-parts-view").hidden = view !== "spare-parts";
   document.getElementById("sold-view").hidden = view !== "sold";
   document.getElementById("garage-view").hidden = view !== "garage";
-  document.getElementById("listing-filters").hidden = ["garage", "knowledge"].includes(view);
+  document.getElementById("listing-filters").hidden = ["garage", "knowledge", "spare-parts"].includes(view);
   for (const button of document.querySelectorAll(".nav-button")) {
     const active = button.dataset.view === view;
     button.classList.toggle("active", active);
@@ -1379,9 +1631,10 @@ function switchView(view, shouldRefresh = true) {
   }
   const analytics = view === "analytics";
   const knowledge = view === "knowledge";
+  const spareParts = view === "spare-parts";
   const sold = view === "sold";
   const garage = view === "garage";
-  setText("view-title", garage ? "Гараж" : sold ? "Проданные" : knowledge ? "Слабые места" : analytics ? "Аналитика рынка" : "Объявления");
+  setText("view-title", garage ? "Гараж" : sold ? "Проданные" : spareParts ? "Автозапчасти" : knowledge ? "Слабые места" : analytics ? "Аналитика рынка" : "Объявления");
   setText(
     "view-subtitle",
     garage
@@ -1390,6 +1643,8 @@ function switchView(view, shouldRefresh = true) {
       ? "Архив завершённых объявлений, цены продажи и срок нахождения на рынке."
       : knowledge
       ? "Общая база типовых неисправностей, полученных из сохранённых анализов ChatGPT."
+      : spareParts
+      ? "Реальные предложения запчастей с Drom, связанные с марками, моделями и поколениями."
       : analytics
       ? "Цены, динамика предложения, структура автопарка и варианты ниже рынка."
       : "Актуальная выборка, история цен и подробные карточки автомобилей.",
@@ -1620,12 +1875,55 @@ function renderDetailTrims(item) {
   }
 }
 
-function renderVehicleAnalysis(vehicleAnalysis, listingAssessment = null) {
+function appendCompatibleSpareParts(root, spareParts) {
+  const compatible = spareParts?.compatible_offers || [];
+  if (!compatible.length) return;
+  const section = document.createElement("section");
+  section.className = "analysis-compatible-parts";
+  const header = document.createElement("header");
+  const title = document.createElement("strong");
+  title.textContent = "Совместимые запчасти из базы";
+  const caption = document.createElement("small");
+  caption.textContent = `${money.format(spareParts.offers_count || compatible.length)} предложений`;
+  header.append(title, caption);
+  const offers = document.createElement("div");
+  offers.className = "analysis-part-offers";
+  for (const offer of compatible.slice(0, 6)) {
+    const link = document.createElement("a");
+    link.className = "analysis-part-offer";
+    link.href = offer.source_url;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    if (offer.image_url) {
+      const image = document.createElement("img");
+      image.src = offer.image_url;
+      image.alt = "";
+      image.loading = "lazy";
+      link.append(image);
+    }
+    const copy = document.createElement("span");
+    const name = document.createElement("strong");
+    name.textContent = offer.name;
+    const meta = document.createElement("small");
+    meta.textContent = [
+      formatMoney(offer.price), offer.subcategory || offer.category,
+      offer.seller || "Drom",
+    ].filter(Boolean).join(" · ");
+    copy.append(name, meta);
+    link.append(copy);
+    offers.append(link);
+  }
+  section.append(header, offers);
+  root.append(section);
+}
+
+function renderVehicleAnalysis(vehicleAnalysis, listingAssessment = null, spareParts = currentDetailItem?.spare_parts) {
   const root = document.getElementById("vehicle-analysis-result");
   const stateLabel = document.getElementById("vehicle-analysis-state");
   root.replaceChildren();
   const analysis = vehicleAnalysis?.data;
   const assessment = listingAssessment?.data;
+  appendCompatibleSpareParts(root, spareParts);
   if (!analysis) {
     stateLabel.textContent = "Нет сохранённого анализа";
     root.append(emptyNote("Скопируйте промт, получите JSON-ответ и сохраните его здесь."));
@@ -1684,6 +1982,36 @@ function renderVehicleAnalysis(vehicleAnalysis, listingAssessment = null) {
     ].filter(Boolean).join(" · ");
     row.append(title, details);
     root.append(row);
+    const marketMatch = (spareParts?.matches || []).find(
+      (match) => point.id && match.weak_point_id === point.id,
+    );
+    if (marketMatch?.offers?.length) {
+      const offers = document.createElement("div");
+      offers.className = "analysis-part-offers";
+      for (const offer of marketMatch.offers) {
+        const link = document.createElement("a");
+        link.className = `analysis-part-offer${offer.id === marketMatch.selected_offer_id ? " is-selected" : ""}`;
+        link.href = offer.source_url;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        if (offer.image_url) {
+          const image = document.createElement("img");
+          image.src = offer.image_url;
+          image.alt = "";
+          image.loading = "lazy";
+          link.append(image);
+        }
+        const copy = document.createElement("span");
+        const name = document.createElement("strong");
+        name.textContent = offer.name;
+        const seller = document.createElement("small");
+        seller.textContent = [formatMoney(offer.price), offer.seller || "Drom"].join(" · ");
+        copy.append(name, seller);
+        link.append(copy);
+        offers.append(link);
+      }
+      root.append(offers);
+    }
   }
   if (assessment?.remaining_investments?.length) {
     const investments = document.createElement("div");
@@ -1711,6 +2039,31 @@ function renderVehicleAnalysis(vehicleAnalysis, listingAssessment = null) {
     const row = document.createElement("div");
     row.className = "analysis-budget";
     row.textContent = `Ожидаемые вложения в запчасти для этого автомобиля: ${formatMoney(budget.min)}–${formatMoney(budget.max)}${budget.notes ? ` · ${budget.notes}` : ""}`;
+    root.append(row);
+  }
+  if (spareParts?.costs && (spareParts.matches?.length || spareParts.costs.investment_max)) {
+    const costs = spareParts.costs;
+    const row = document.createElement("div");
+    row.className = "analysis-cost-total";
+    const heading = document.createElement("strong");
+    heading.textContent = "Полная стоимость обслуживания и вложений";
+    const lines = document.createElement("dl");
+    for (const [label, value] of [
+      ["Запчасти из базы", formatMoney(costs.parts)],
+      ["Работы", `${formatMoney(costs.labor_min)}–${formatMoney(costs.labor_max)}`],
+      ["Обслуживание", `${formatMoney(costs.service_min)}–${formatMoney(costs.service_max)}`],
+      ["Все ожидаемые вложения", `${formatMoney(costs.investment_min)}–${formatMoney(costs.investment_max)}`],
+      ["Автомобиль + вложения", `${formatMoney(costs.total_entry_min)}–${formatMoney(costs.total_entry_max)}`],
+    ]) {
+      const term = document.createElement("div");
+      const dt = document.createElement("dt");
+      const dd = document.createElement("dd");
+      dt.textContent = label;
+      dd.textContent = value;
+      term.append(dt, dd);
+      lines.append(term);
+    }
+    row.append(heading, lines);
     root.append(row);
   }
   for (const [title, values] of [
@@ -1776,6 +2129,46 @@ function renderAnalysisTrimSelector(item) {
       renderVehicleAnalysis(item.vehicle_analysis, item.listing_assessment);
     }
   };
+}
+
+function renderDetailSparePartsState(spareParts, importPayload = null) {
+  const root = document.getElementById("detail-spare-parts-state");
+  root.replaceChildren();
+  const summary = document.createElement("p");
+  summary.textContent = importPayload?.verification_required
+    ? importPayload.error || "Drom запросил ручную проверку «не робот»."
+    : importPayload
+    ? [
+        `Собрано ${money.format(importPayload.imported || 0)} предложений${importPayload.generation ? ` · ${importPayload.generation} поколение` : ""}.`,
+        importPayload.warning,
+        importPayload.failed_categories
+          ? `Не ответили тематические выдачи: ${money.format(importPayload.failed_categories)}.`
+          : null,
+      ].filter(Boolean).join(" ")
+    : spareParts?.offers_count
+      ? `В базе найдено ${money.format(spareParts.offers_count)} совместимых предложений.`
+      : "Совместимые предложения ещё не загружены.";
+  root.append(summary);
+  const links = importPayload?.verification_url
+    ? [{ category: "Пройти проверку вручную", url: importPayload.verification_url }]
+    : importPayload?.links || (
+    spareParts?.search_url
+      ? [{ category: "Открыть общий список Drom", url: spareParts.search_url }]
+      : []
+  );
+  if (links.length) {
+    const linkRoot = document.createElement("div");
+    linkRoot.className = "detail-spare-parts-links";
+    for (const entry of links) {
+      const link = document.createElement("a");
+      link.href = entry.url;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.textContent = `${entry.category} ↗`;
+      linkRoot.append(link);
+    }
+    root.append(linkRoot);
+  }
 }
 
 function renderKnowledge(payload = state.knowledgePayload) {
@@ -1869,7 +2262,7 @@ function vehicleAnalysisPrompt(item) {
 1. model_analysis — полный справочник всех типовых слабых мест именно этой модели и комплектации. Не удаляй из него неисправности из-за заявлений продавца: этот блок будет общим только для автомобилей с той же маркой, моделью и комплектацией.
 2. listing_assessment — оценка только этого объявления на основе текста продавца. Если в описании прямо сказано, что узел заменён или обслужен, добавь его ID в excluded_weak_point_ids, чтобы проблема не показывалась в этой карточке. Не считай расплывчатые фразы вроде «всё обслужено» подтверждением конкретного ТО.
 
-Указывай только стоимость запчастей в рублях. Не включай стоимость работ, диагностики и сервисных нормо-часов ни в один диапазон. Не выдумывай точность: давай реалистичные диапазоны.
+Указывай стоимость запчастей и работ раздельно в рублях. В replacement_parts перечисляй конкретные названия деталей, по которым можно найти товарное предложение (например, «термостат», «водяная помпа»). Не выдумывай точность: давай реалистичные диапазоны.
 
 Верни только валидный JSON без Markdown по схеме:
 {
@@ -1885,6 +2278,9 @@ function vehicleAnalysisPrompt(item) {
         "check": "как проверить перед покупкой",
         "parts_cost_min": 0,
         "parts_cost_max": 0,
+        "labor_cost_min": 0,
+        "labor_cost_max": 0,
+        "replacement_parts": ["название детали для поиска в базе"],
         "priority": "high|medium|low"
       }
     ],
@@ -2055,6 +2451,7 @@ function openDetails(item) {
   renderDetailTrims(item);
   renderAnalysisTrimSelector(item);
   renderVehicleAnalysis(item.vehicle_analysis, item.listing_assessment);
+  renderDetailSparePartsState(item.spare_parts);
   const drive2 = document.getElementById("detail-drive2");
   drive2.hidden = !item.drive2_url;
   if (item.drive2_url) drive2.href = item.drive2_url;
@@ -2066,6 +2463,53 @@ function openDetails(item) {
   detailsDialog.showModal();
   return loadGallery(item, token);
 }
+
+document.getElementById("detail-spare-parts-import").addEventListener(
+  "click",
+  async () => {
+    if (!currentDetailItem) return;
+    const button = document.getElementById("detail-spare-parts-import");
+    const root = document.getElementById("detail-spare-parts-state");
+    button.disabled = true;
+    root.replaceChildren();
+    const status = document.createElement("p");
+    status.textContent = "Определяем поколение и собираем тематические выдачи Drom…";
+    root.append(status);
+    try {
+      const response = await fetch("/api/spare-parts/import-for-car", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          source: currentDetailItem.source,
+          external_id: currentDetailItem.external_id,
+        }),
+      });
+      const payload = await response.json();
+      if (!response.ok && payload.verification_required) {
+        renderDetailSparePartsState(currentDetailItem.spare_parts, payload);
+        return;
+      }
+      if (!response.ok) throw new Error(payload.error || "Не удалось собрать запчасти");
+      currentDetailItem.spare_parts = payload.spare_parts;
+      renderDetailSparePartsState(payload.spare_parts, payload);
+      renderVehicleAnalysis(
+        currentDetailItem.vehicle_analysis,
+        currentDetailItem.listing_assessment,
+        payload.spare_parts,
+      );
+      state.listingsSignature = "";
+      state.sparePartsSignature = "";
+    } catch (error) {
+      root.replaceChildren();
+      const message = document.createElement("p");
+      message.className = "is-error";
+      message.textContent = error.message;
+      root.append(message);
+    } finally {
+      button.disabled = false;
+    }
+  },
+);
 
 document.getElementById("vehicle-prompt-copy").addEventListener(
   "click",

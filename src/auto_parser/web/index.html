@@ -23,6 +23,9 @@
         <button class="nav-button" type="button" data-view="knowledge">
           База данных
         </button>
+        <button class="nav-button" type="button" data-view="spare-parts">
+          Автозапчасти
+        </button>
         <button class="nav-button" type="button" data-view="sold">
           Проданные
         </button>
@@ -375,6 +378,94 @@
         </div>
       </section>
 
+      <section id="spare-parts-view" class="app-view spare-parts-view" hidden>
+        <div class="section-heading spare-parts-heading">
+          <div>
+            <p class="eyebrow">Реальные предложения продавцов</p>
+            <h2>Автозапчасти</h2>
+            <p>Импортируйте список Drom: фото, название, описание и цена сохранятся в локальной базе и будут привязаны к модели и поколению.</p>
+          </div>
+        </div>
+        <form id="spare-parts-import" class="spare-parts-import">
+          <label>
+            <span>Ссылка на список запчастей Drom</span>
+            <input id="spare-parts-url" name="url" type="url" list="spare-parts-sources" required placeholder="https://baza.drom.ru/sell_spare_parts/model/…">
+          </label>
+          <datalist id="spare-parts-sources"></datalist>
+          <label class="spare-parts-pages">
+            <span>Страниц</span>
+            <select id="spare-parts-import-pages" name="pages">
+              <option value="1">1 · до 50</option>
+              <option value="3" selected>3 · до 150</option>
+              <option value="5">5 · до 250</option>
+              <option value="10">10 · до 500</option>
+            </select>
+          </label>
+          <button class="primary-button" type="submit">Получить запчасти</button>
+          <span id="spare-parts-import-state" role="status"></span>
+        </form>
+        <aside class="spare-parts-capture">
+          <div>
+            <strong>Импорт после ручной CAPTCHA</strong>
+            <p>Один раз перетащите кнопку в панель закладок. Затем откройте список Drom, пройдите проверку и нажмите эту закладку — открытая выдача сама передастся в AutoScope.</p>
+          </div>
+          <a id="spare-parts-bookmarklet" class="acid-link" href="#">AutoScope: импорт Drom</a>
+        </aside>
+        <div class="parts-kpis spare-parts-kpis">
+          <article><span>Предложений</span><strong id="spare-parts-count">0</strong></article>
+          <article><span>С указанной ценой</span><strong id="spare-parts-priced">0</strong></article>
+          <article><span>Моделей</span><strong id="spare-parts-models">0</strong></article>
+        </div>
+        <section class="spare-parts-browser" aria-label="Фильтры каталога запчастей">
+          <div id="spare-parts-tabs" class="spare-parts-tabs" role="tablist"></div>
+          <div class="spare-parts-filters">
+            <label class="spare-parts-filter spare-parts-search">
+              <span>Поиск</span>
+              <input id="spare-parts-search" type="search" placeholder="Название, описание, продавец…">
+            </label>
+            <label class="spare-parts-filter">
+              <span>Автомобиль</span>
+              <select id="spare-parts-vehicle"><option value="">Все модели</option></select>
+            </label>
+            <label class="spare-parts-filter">
+              <span>Поколение</span>
+              <select id="spare-parts-generation"><option value="">Все</option></select>
+            </label>
+            <label class="spare-parts-filter">
+              <span>Цена от</span>
+              <input id="spare-parts-min-price" type="number" min="0" step="500" placeholder="0">
+            </label>
+            <label class="spare-parts-filter">
+              <span>Цена до</span>
+              <input id="spare-parts-max-price" type="number" min="0" step="500" placeholder="Без лимита">
+            </label>
+            <label class="spare-parts-filter">
+              <span>Сортировка</span>
+              <select id="spare-parts-sort">
+                <option value="price_asc">Сначала дешевле</option>
+                <option value="price_desc">Сначала дороже</option>
+                <option value="newest">Сначала свежие</option>
+                <option value="name">По названию</option>
+              </select>
+            </label>
+            <label class="spare-parts-priced-toggle">
+              <input id="spare-parts-priced-only" type="checkbox">
+              <span>Только с ценой</span>
+            </label>
+            <button id="spare-parts-reset" class="ghost-button" type="button">Сбросить</button>
+          </div>
+        </section>
+        <div class="spare-parts-result-bar">
+          <span id="spare-parts-result-caption">—</span>
+          <div id="spare-parts-pagination" class="spare-parts-pagination"></div>
+        </div>
+        <div id="spare-parts-list" class="spare-parts-list"></div>
+        <div id="spare-parts-empty" class="empty" hidden>
+          <strong>База запчастей пока пуста</strong>
+          <p>Выберите одну из предложенных ссылок и запустите импорт.</p>
+        </div>
+      </section>
+
       <section id="sold-view" class="app-view sold-view" hidden>
         <div id="sold-kpis" class="market-kpis" aria-label="Показатели проданных автомобилей"></div>
         <div class="section-heading">
@@ -558,7 +649,11 @@
             <a id="detail-drive2" class="ghost-link" target="_blank" rel="noopener noreferrer">
               Бортжурналы на DRIVE2 ↗
             </a>
+            <button id="detail-spare-parts-import" class="ghost-button" type="button">
+              Собрать автозапчасти
+            </button>
           </div>
+          <div id="detail-spare-parts-state" class="detail-spare-parts-state" role="status"></div>
           <section class="vehicle-analysis">
             <div class="vehicle-analysis-heading">
               <div>

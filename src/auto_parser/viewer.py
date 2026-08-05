@@ -33,6 +33,7 @@ from auto_parser.notification_api import NotificationApiMixin
 from auto_parser.parts_api import PartsApiMixin
 from auto_parser.request_governor import RequestGovernor
 from auto_parser.service import SearchService
+from auto_parser.spare_parts import listing_spare_parts_payload
 from auto_parser.sources import (
     ALL_CARS_QUERY,
     source_from_name,
@@ -394,6 +395,8 @@ class ViewerHandler(
             self._parts_cars()
         elif parsed.path == "/api/parts":
             self._parts(parse_qs(parsed.query))
+        elif parsed.path == "/api/spare-parts":
+            self._spare_parts_catalog(parse_qs(parsed.query))
         elif parsed.path.startswith("/media/"):
             self._media(parsed.path)
         else:
@@ -419,6 +422,15 @@ class ViewerHandler(
             return
         if parsed.path == "/api/parts/seed":
             self._seed_parts()
+            return
+        if parsed.path == "/api/spare-parts/import":
+            self._import_spare_parts()
+            return
+        if parsed.path == "/api/spare-parts/import-html":
+            self._import_spare_parts_html()
+            return
+        if parsed.path == "/api/spare-parts/import-for-car":
+            self._import_spare_parts_for_car()
             return
         parts = parsed.path.strip("/").split("/")
         if (
@@ -616,6 +628,10 @@ class ViewerHandler(
                         item["source"],
                         item["external_id"],
                     )
+                )
+                item["spare_parts"] = listing_spare_parts_payload(
+                    repository,
+                    item,
                 )
                 item["thumbnail_url"] = (
                     f"/media/{item['source']}/{item['external_id']}/0"
