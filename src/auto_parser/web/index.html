@@ -70,61 +70,89 @@
       </section>
 
       <section id="listing-filters" class="filters" aria-label="Фильтры объявлений">
-        <label class="search-field">
-          <span>Поиск</span>
-          <input id="search" type="search" placeholder="Марка, модель или текст описания">
-        </label>
-        <label>
-          <span>Цена от, ₽</span>
-          <input id="min-price" type="number" min="0" step="50000" placeholder="0">
-        </label>
-        <label>
-          <span>Цена до, ₽</span>
-          <input id="max-price" type="number" min="0" step="50000" placeholder="Без лимита">
-        </label>
-        <label>
-          <span>Пробег от, км</span>
-          <input id="min-mileage" type="number" min="0" step="10000" placeholder="0">
-        </label>
-        <label>
-          <span>Пробег до, км</span>
-          <input id="max-mileage" type="number" min="0" step="10000" placeholder="Без лимита">
-        </label>
-        <label>
-          <span>Площадка</span>
-          <select id="source"><option value="">Все площадки</option></select>
-        </label>
-        <label>
-          <span>Марка</span>
-          <select id="brand"><option value="">Все марки</option></select>
-        </label>
-        <label>
-          <span>Город</span>
-          <select id="location"><option value="">Все города</option></select>
-        </label>
-        <label>
-          <span>Видимость</span>
-          <select id="visibility">
-            <option value="visible">Только видимые</option>
-            <option value="hidden">Только скрытые</option>
-            <option value="source_hidden">Скрытые на площадке</option>
-            <option value="all">Все объявления</option>
-          </select>
-        </label>
-        <label>
-          <span>Сортировка</span>
-          <select id="sort">
-            <option value="recently_updated">Недавно обновлённые</option>
-            <option value="recently_added">Недавно добавленные</option>
-            <option value="price_asc">Сначала дешевле</option>
-            <option value="price_desc">Сначала дороже</option>
-            <option value="mileage_asc">Меньше пробег</option>
-            <option value="mileage_desc">Больше пробег</option>
-            <option value="power_asc">Меньше лошадиных сил</option>
-            <option value="power_desc">Больше лошадиных сил</option>
-          </select>
-        </label>
-        <button id="reset" class="ghost-button" type="button">Сбросить</button>
+        <div class="filters-heading">
+          <div>
+            <p class="eyebrow">Умный поиск</p>
+            <h2>Подберите автомобиль</h2>
+            <p>Начните вводить марку, модель, год или любой параметр — варианты берутся из вашей базы.</p>
+          </div>
+          <button id="reset" class="filter-reset" type="button">Очистить фильтры</button>
+        </div>
+
+        <div class="filter-primary-grid">
+          <label class="search-field">
+            <span>Поиск по всей базе</span>
+            <input id="search" type="search" placeholder="Например: Volvo XC90 2018 дизель">
+          </label>
+          <label>
+            <span>Марка</span>
+            <input id="brand" type="search" list="brand-options" autocomplete="off" placeholder="Начните вводить">
+            <datalist id="brand-options"></datalist>
+          </label>
+          <label>
+            <span>Модель</span>
+            <input id="model" type="search" list="model-options" autocomplete="off" placeholder="Все модели">
+            <datalist id="model-options"></datalist>
+          </label>
+          <label>
+            <span>Год выпуска</span>
+            <input id="year" type="search" list="year-options" inputmode="numeric" autocomplete="off" placeholder="Например, 2019">
+            <datalist id="year-options"></datalist>
+          </label>
+        </div>
+
+        <div class="filter-secondary-grid">
+          <fieldset class="range-filter">
+            <legend>Цена, ₽</legend>
+            <input id="min-price" aria-label="Цена от" type="number" min="0" step="50000" placeholder="От">
+            <span>—</span>
+            <input id="max-price" aria-label="Цена до" type="number" min="0" step="50000" placeholder="До">
+          </fieldset>
+          <fieldset class="range-filter">
+            <legend>Пробег, км</legend>
+            <input id="min-mileage" aria-label="Пробег от" type="number" min="0" step="10000" placeholder="От">
+            <span>—</span>
+            <input id="max-mileage" aria-label="Пробег до" type="number" min="0" step="10000" placeholder="До">
+          </fieldset>
+          <label>
+            <span>Город</span>
+            <input id="location" type="search" list="location-options" autocomplete="off" placeholder="Любой город">
+            <datalist id="location-options"></datalist>
+          </label>
+          <label>
+            <span>Площадка</span>
+            <select id="source"><option value="">Все площадки</option></select>
+          </label>
+          <label>
+            <span>Сортировка</span>
+            <select id="sort">
+              <option value="recently_updated">Недавно обновлённые</option>
+              <option value="recently_added">Недавно добавленные</option>
+              <option value="price_asc">Сначала дешевле</option>
+              <option value="price_desc">Сначала дороже</option>
+              <option value="mileage_asc">Меньше пробег</option>
+              <option value="mileage_desc">Больше пробег</option>
+              <option value="power_asc">Меньше лошадиных сил</option>
+              <option value="power_desc">Больше лошадиных сил</option>
+            </select>
+          </label>
+          <label>
+            <span>Показывать</span>
+            <select id="visibility">
+              <option value="visible">Только видимые</option>
+              <option value="hidden">Только скрытые</option>
+              <option value="source_hidden">Скрытые на площадке</option>
+              <option value="all">Все объявления</option>
+            </select>
+          </label>
+          <label>
+            <span>Подборка</span>
+            <select id="favorite">
+              <option value="">Все объявления</option>
+              <option value="1">Только избранные</option>
+            </select>
+          </label>
+        </div>
         <div id="active-profile-filter" class="active-profile-filter" hidden>
           <span>Показаны результаты поиска: <strong></strong></span>
           <button id="active-profile-clear" type="button">Показать все объявления</button>
@@ -135,10 +163,6 @@
             <strong id="advanced-filter-count">Не выбраны</strong>
           </summary>
           <div class="advanced-filter-grid">
-            <details class="multi-filter" data-filter="year">
-              <summary><span>Год выпуска</span><strong>Все</strong></summary>
-              <div class="multi-options"></div>
-            </details>
             <details class="multi-filter" data-filter="fuel">
               <summary><span>Тип двигателя</span><strong>Все</strong></summary>
               <div class="multi-options"></div>
@@ -579,16 +603,27 @@
           <div class="image-fallback">AUTO</div>
           <span class="card-image-loader" role="status" aria-label="Фотография загружается"></span>
           <span class="source-badge"></span>
+          <span class="car-market-badge"></span>
         </div>
         <div class="car-body">
-          <div class="car-price"></div>
-          <h3 class="car-title"></h3>
+          <div class="car-heading">
+            <h3 class="car-title"></h3>
+            <div class="car-price"></div>
+          </div>
           <div class="car-facts">
+            <span class="car-year"></span>
             <span class="car-mileage"></span>
             <span class="car-location"></span>
-            <span class="car-published"></span>
+          </div>
+          <div class="car-market-summary">
+            <strong class="car-market-position"></strong>
+            <span class="car-market-sample"></span>
           </div>
           <p class="car-description"></p>
+          <div class="car-context">
+            <span class="car-published"></span>
+            <span class="car-note-indicator" hidden>Есть заметка</span>
+          </div>
           <div class="card-data-loader" role="status" aria-live="polite" hidden>
             <span class="loader-spinner" aria-hidden="true"></span>
             <span class="card-data-loader-text"></span>
@@ -596,8 +631,10 @@
           <div class="car-footer">
             <span class="car-seen"></span>
             <div class="car-actions">
-              <button class="car-garage" type="button"></button>
-              <button class="car-hide" type="button"></button>
+              <button class="car-favorite card-icon-action" type="button"></button>
+              <button class="car-compare card-icon-action" type="button"></button>
+              <button class="car-garage card-secondary-action" type="button"></button>
+              <button class="car-hide card-secondary-action" type="button"></button>
               <a class="car-link" target="_blank" rel="noopener noreferrer">Открыть ↗</a>
             </div>
           </div>
@@ -608,7 +645,7 @@
     <dialog id="details-dialog" class="dialog details-dialog">
       <button class="dialog-close" type="button" aria-label="Закрыть">×</button>
       <div class="detail-layout">
-        <section>
+        <section class="detail-media-panel">
           <div class="carousel">
             <button id="carousel-prev" type="button" aria-label="Предыдущее фото">‹</button>
             <img id="detail-image" alt="" title="Открыть на весь экран">
@@ -622,41 +659,87 @@
             <span id="carousel-count"></span>
           </div>
           <div id="carousel-thumbs" class="carousel-thumbs"></div>
+          <p class="detail-media-caption">Фотографии и данные объявления обновляются при открытии карточки.</p>
         </section>
         <section class="detail-info">
-          <p id="detail-brand" class="eyebrow"></p>
-          <h2 id="detail-title"></h2>
-          <div id="detail-price" class="detail-price"></div>
-          <div class="detail-summary">
-            <div><span>Пробег</span><strong id="detail-mileage"></strong></div>
-            <div><span>Просмотры</span><strong id="detail-views"></strong></div>
-            <div>
-              <span>Опубликовано</span>
-              <strong id="detail-published"></strong>
-              <small id="detail-published-note"></small>
+          <section class="detail-overview-card">
+            <div class="detail-title-row">
+              <div>
+                <p id="detail-brand" class="eyebrow"></p>
+                <h2 id="detail-title"></h2>
+              </div>
+              <div id="detail-price" class="detail-price"></div>
             </div>
-            <div><span>Город</span><strong id="detail-location"></strong></div>
-          </div>
-          <h3>Описание</h3>
-          <p id="detail-description" class="detail-description"></p>
-          <p id="detail-load-status" class="detail-load-status" role="status"></p>
-          <h3>Характеристики</h3>
-          <dl id="detail-attributes" class="attributes"></dl>
-          <h3>Комплектация</h3>
-          <div id="detail-trims" class="detail-trims"></div>
-          <div class="detail-links">
-            <a id="detail-link" class="acid-link" target="_blank" rel="noopener noreferrer">
-              Исходное объявление ↗
-            </a>
-            <a id="detail-drive2" class="ghost-link" target="_blank" rel="noopener noreferrer">
-              Бортжурналы на DRIVE2 ↗
-            </a>
-            <button id="detail-spare-parts-import" class="ghost-button" type="button">
-              Собрать автозапчасти
-            </button>
-          </div>
-          <div id="detail-spare-parts-state" class="detail-spare-parts-state" role="status"></div>
-          <section class="vehicle-analysis">
+            <div class="detail-primary-actions">
+              <button id="detail-favorite" class="ghost-button" type="button"></button>
+              <button id="detail-compare" class="ghost-button" type="button"></button>
+            </div>
+            <div class="detail-summary">
+              <div><span>Пробег</span><strong id="detail-mileage"></strong></div>
+              <div><span>Просмотры</span><strong id="detail-views"></strong></div>
+              <div>
+                <span>Опубликовано</span>
+                <strong id="detail-published"></strong>
+                <small id="detail-published-note"></small>
+              </div>
+              <div><span>Город</span><strong id="detail-location"></strong></div>
+            </div>
+            <section class="detail-market">
+              <div class="detail-market-heading">
+                <div>
+                  <span class="section-kicker">Рынок поколения</span>
+                  <h3 id="detail-market-title">Статистика модели в базе</h3>
+                </div>
+                <span id="detail-market-position"></span>
+              </div>
+              <div id="detail-market-metrics" class="detail-market-metrics"></div>
+            </section>
+          </section>
+
+          <section class="detail-content-card listing-review">
+            <div class="detail-section-heading">
+              <div>
+                <span class="section-kicker">Объявление продавца</span>
+                <h3>Описание и личные пометки</h3>
+              </div>
+            </div>
+            <p id="detail-description" class="detail-description"></p>
+            <p id="detail-load-status" class="detail-load-status" role="status"></p>
+            <div class="listing-note">
+              <label for="detail-note">Моя заметка</label>
+              <textarea id="detail-note" rows="3" maxlength="5000" placeholder="Что проверить, о чём спросить продавца…"></textarea>
+              <div>
+                <small id="detail-note-state"></small>
+                <button id="detail-note-save" class="ghost-button" type="button">Сохранить заметку</button>
+              </div>
+            </div>
+          </section>
+
+          <section class="detail-content-card vehicle-specification">
+            <div class="detail-section-heading">
+              <div>
+                <span class="section-kicker">Конфигурация</span>
+                <h3>Характеристики автомобиля</h3>
+              </div>
+            </div>
+            <dl id="detail-attributes" class="attributes"></dl>
+            <div class="detail-subsection-heading">Комплектация</div>
+            <div id="detail-trims" class="detail-trims"></div>
+            <div class="detail-links">
+              <a id="detail-link" class="acid-link" target="_blank" rel="noopener noreferrer">
+                Исходное объявление ↗
+              </a>
+              <a id="detail-drive2" class="ghost-link" target="_blank" rel="noopener noreferrer">
+                Бортжурналы на DRIVE2 ↗
+              </a>
+              <button id="detail-spare-parts-import" class="ghost-button" type="button">
+                Собрать автозапчасти
+              </button>
+            </div>
+            <div id="detail-spare-parts-state" class="detail-spare-parts-state" role="status"></div>
+          </section>
+
+          <section class="vehicle-analysis detail-content-card">
             <div class="vehicle-analysis-heading">
               <div>
                 <h3>Слабые места и вложения</h3>
@@ -682,6 +765,26 @@
           </section>
         </section>
       </div>
+    </dialog>
+
+    <aside id="comparison-bar" class="comparison-bar" hidden>
+      <div>
+        <strong>Сравнение автомобилей</strong>
+        <span id="comparison-selection"></span>
+      </div>
+      <div>
+        <button id="comparison-clear" class="ghost-button" type="button">Очистить</button>
+        <button id="comparison-open" class="primary-button" type="button" disabled>Сравнить</button>
+      </div>
+    </aside>
+
+    <dialog id="comparison-dialog" class="dialog comparison-dialog">
+      <button class="dialog-close" type="button" aria-label="Закрыть">×</button>
+      <header>
+        <p class="eyebrow">Сравнение</p>
+        <h2>Два автомобиля рядом</h2>
+      </header>
+      <div id="comparison-content" class="comparison-content"></div>
     </dialog>
 
     <dialog id="image-lightbox" class="image-lightbox">

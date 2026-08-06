@@ -77,6 +77,14 @@ def build_filters(
         elif visibility != "all":
             conditions.append("l.hidden = 0")
 
+    if query.get("favorite", [""])[0].strip() == "1":
+        conditions.append(
+            "EXISTS (SELECT 1 FROM listing_user_data ud "
+            "WHERE ud.source = l.source "
+            "AND ud.external_id = l.external_id "
+            "AND ud.favorite = 1)"
+        )
+
     for name, expression in (
         ("min_price", "l.price >= ?"),
         ("max_price", "l.price <= ?"),
@@ -89,9 +97,16 @@ def build_filters(
             values.append(value)
 
     for name, expression in (
-        ("location", "l.location = ?"),
-        ("brand", "l.brand = ?"),
-        ("model", "l.model = ?"),
+        ("location", "LOWER(COALESCE(l.location, '')) LIKE ?"),
+        ("brand", "LOWER(COALESCE(l.brand, '')) LIKE ?"),
+        ("model", "LOWER(COALESCE(l.model, '')) LIKE ?"),
+    ):
+        value = query.get(name, [""])[0].strip()
+        if value:
+            conditions.append(expression)
+            values.append(f"%{value.casefold()}%")
+
+    for name, expression in (
         ("source", "l.source = ?"),
         ("external_id", "l.external_id = ?"),
     ):
@@ -133,10 +148,15 @@ def build_filters(
     search = query.get("q", [""])[0].strip().casefold()
     if search:
         conditions.append(
-            "(LOWER(l.title) LIKE ? OR LOWER(COALESCE(l.description, '')) LIKE ?)"
+            "(LOWER(l.title) LIKE ? "
+            "OR LOWER(COALESCE(l.description, '')) LIKE ? "
+            "OR LOWER(COALESCE(l.brand, '')) LIKE ? "
+            "OR LOWER(COALESCE(l.model, '')) LIKE ? "
+            "OR LOWER(COALESCE(l.location, '')) LIKE ? "
+            "OR LOWER(COALESCE(l.attributes_json, '')) LIKE ?)"
         )
         pattern = f"%{search}%"
-        values.extend((pattern, pattern))
+        values.extend([pattern] * 6)
 
     return (" WHERE " + " AND ".join(conditions) if conditions else ""), values
 

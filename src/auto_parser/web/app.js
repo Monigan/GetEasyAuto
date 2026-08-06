@@ -24,17 +24,21 @@ const state = {
 };
 const ids = [
   "search", "min-price", "max-price", "min-mileage",
-  "max-mileage", "source", "brand", "location", "visibility", "sort"
+  "max-mileage", "source", "brand", "model", "year", "location",
+  "visibility", "favorite", "sort"
 ];
 const elements = Object.fromEntries(ids.map((id) => [id, document.getElementById(id)]));
 const multiFilterElements = [...document.querySelectorAll(".multi-filter")];
 const PREFERENCES_KEY = "autoscope.filters.v1";
+const COMPARISON_KEY = "autoscope.comparison.v1";
 let refreshActivitySignature = "";
 let refreshActivityTimer;
 let latestRefreshActivity = { items: [], running_count: 0 };
 let refreshActivityOpen = false;
 let displayedListingsSignature = "";
 let displayedListingsReportedAt = 0;
+let modelsByBrand = {};
+let allModelOptions = [];
 
 function displayedListingsClientId() {
   const key = "autoscope.displayed-listings-client.v1";
@@ -110,6 +114,17 @@ function loadPreferences() {
 }
 
 const savedPreferences = loadPreferences();
+const comparisonSelection = new Map();
+try {
+  const savedComparison = JSON.parse(localStorage.getItem(COMPARISON_KEY) || "[]");
+  for (const item of savedComparison.slice(0, 2)) {
+    if (item?.source && item?.external_id) {
+      comparisonSelection.set(`${item.source}:${item.external_id}`, item);
+    }
+  }
+} catch {
+  // Сравнение продолжит работать без сохранения между перезагрузками.
+}
 const multiFilterState = new Map(
   multiFilterElements.map((element) => [
     element.dataset.filter,
@@ -118,6 +133,74 @@ const multiFilterState = new Map(
 );
 const garageController = createGarageController();
 const notificationCenter = createNotificationCenter();
+
+function listingKey(item) {
+  return `${item.source}:${item.external_id}`;
+}
+
+function renderComparisonSelection() {
+  const bar = document.getElementById("comparison-bar");
+  const items = [...comparisonSelection.values()];
+  bar.hidden = items.length === 0;
+  setText(
+    "comparison-selection",
+    items.length
+      ? items.map((item) => item.title || item.external_id).join(" ↔ ")
+      : "Выберите два объявления",
+  );
+  document.getElementById("comparison-open").disabled = items.length !== 2;
+  for (const button of document.querySelectorAll(".car-compare")) {
+    const selected = comparisonSelection.has(button.dataset.listingKey);
+    button.classList.toggle("is-selected", selected);
+    button.textContent = selected ? "В сравнении" : "Сравнить";
+  }
+  if (currentDetailItem) {
+    const selected = comparisonSelection.has(listingKey(currentDetailItem));
+    const button = document.getElementById("detail-compare");
+    button.classList.toggle("is-selected", selected);
+    button.textContent = selected ? "Убрать из сравнения" : "Добавить к сравнению";
+  }
+  try {
+    localStorage.setItem(COMPARISON_KEY, JSON.stringify(items));
+  } catch {
+    // Состояние остаётся доступно до перезагрузки страницы.
+  }
+}
+
+function toggleComparison(item) {
+  const key = listingKey(item);
+  if (comparisonSelection.has(key)) {
+    comparisonSelection.delete(key);
+  } else {
+    if (comparisonSelection.size >= 2) {
+      alert("В сравнении уже два автомобиля. Уберите один из них.");
+      return;
+    }
+    comparisonSelection.set(key, {
+      source: item.source,
+      external_id: item.external_id,
+      title: item.title,
+    });
+  }
+  renderComparisonSelection();
+}
+
+async function saveListingUserData(item, changes) {
+  const current = item.user_data || { favorite: false, note: "" };
+  const response = await fetch(
+    `/api/listings/${encodeURIComponent(item.source)}/${encodeURIComponent(item.external_id)}/user-data`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...current, ...changes }),
+    },
+  );
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.error || "Не удалось сохранить данные");
+  item.user_data = payload;
+  state.listingsSignature = "";
+  return payload;
+}
 
 function savePreferences() {
   const controls = Object.fromEntries(
@@ -163,8 +246,11 @@ function params(includePage = true) {
     "max-mileage": "max_mileage",
     source: "source",
     brand: "brand",
+    model: "model",
+    year: "year",
     location: "location",
     visibility: "visibility",
+    favorite: "favorite",
     sort: "sort",
   };
   for (const [id, name] of Object.entries(mapping)) {
@@ -193,6 +279,54 @@ function displayPublished(value) {
   return Number.isNaN(parsed.getTime()) ? value : new Intl.DateTimeFormat(
     "ru-RU", { dateStyle: "medium", timeStyle: "short" }
   ).format(parsed);
+}
+
+function fillDatalist(id, values) {
+  const root = document.getElementById(id);
+  root.replaceChildren();
+  const fragment = document.createDocumentFragment();
+  for (const value of values) {
+    const option = document.createElement("option");
+    option.value = value;
+    fragment.append(option);
+  }
+  root.append(fragment);
+}
+
+function updateModelDatalist() {
+  const brandQuery = elements.brand.value.trim().toLocaleLowerCase("ru-RU");
+  if (!brandQuery) {
+    fillDatalist("model-options", allModelOptions);
+    return;
+  }
+  const matches = Object.entries(modelsByBrand)
+    .filter(([brand]) => brand.toLocaleLowerCase("ru-RU").includes(brandQuery))
+    .flatMap(([, models]) => models);
+  fillDatalist(
+    "model-options",
+    [...new Set(matches)].sort((left, right) => left.localeCompare(right, "ru")),
+  );
+}
+
+function marketPositionLabel(analytics, { compact = false } = {}) {
+  const difference = analytics?.price_difference_percent;
+  if (difference == null) {
+    return compact ? "Мало данных" : "Нет ценового ориентира";
+  }
+  if (Math.abs(difference) < 2) {
+    return compact ? "На уровне рынка" : "Цена на уровне средней";
+  }
+  return compact
+    ? `${difference < 0 ? "Ниже" : "Выше"} рынка на ${Math.abs(difference)}%`
+    : `${Math.abs(difference)}% ${difference < 0 ? "ниже" : "выше"} средней`;
+}
+
+function marketSampleLabel(analytics) {
+  if (!analytics) return "Статистика ещё не накоплена";
+  const years = analytics.generation_limited
+    ? ` · ${analytics.year_from}–${analytics.year_to} г.`
+    : " · все годы";
+  return `${money.format(analytics.listings_count)} объявлений${years}`;
 }
 
 function updateMultiFilterSummary(element) {
@@ -314,6 +448,9 @@ function renderCards(payload) {
     card.querySelector(".source-badge").textContent = item.source;
     card.querySelector(".car-price").textContent = formatMoney(item.price);
     card.querySelector(".car-title").textContent = item.title;
+    card.querySelector(".car-year").textContent = item.year
+      ? `${item.year} год`
+      : "Год не указан";
     card.querySelector(".car-mileage").textContent = formatMileage(item.mileage_km);
     card.querySelector(".car-location").textContent = item.location || "Город не указан";
     card.querySelector(".car-published").textContent =
@@ -322,10 +459,57 @@ function renderCards(payload) {
         : "Дата не указана";
     card.querySelector(".car-description").textContent =
       item.description || "Описание пока не загружено.";
+    const marketBadge = card.querySelector(".car-market-badge");
+    const marketDifference = item.market_analytics?.price_difference_percent;
+    marketBadge.textContent = marketPositionLabel(
+      item.market_analytics,
+      { compact: true },
+    );
+    marketBadge.classList.toggle(
+      "is-good",
+      marketDifference != null && marketDifference < -2,
+    );
+    marketBadge.classList.toggle(
+      "is-high",
+      marketDifference != null && marketDifference > 2,
+    );
+    card.querySelector(".car-market-position").textContent =
+      item.market_analytics?.average_price == null
+        ? "Средняя цена пока неизвестна"
+        : `Средняя цена ${formatMoney(item.market_analytics.average_price)}`;
+    card.querySelector(".car-market-sample").textContent = marketSampleLabel(
+      item.market_analytics,
+    );
     card.querySelector(".car-seen").textContent = `Обновлено ${formatDate(item.last_seen_at)}`;
     const link = card.querySelector(".car-link");
     link.href = item.url;
     link.addEventListener("click", (event) => event.stopPropagation());
+    item.user_data ||= { favorite: false, note: "" };
+    card.querySelector(".car-note-indicator").hidden = !item.user_data.note;
+    const favoriteButton = card.querySelector(".car-favorite");
+    const renderFavorite = () => {
+      favoriteButton.textContent = item.user_data.favorite ? "★ В избранном" : "☆ Избранное";
+      favoriteButton.classList.toggle("is-selected", item.user_data.favorite);
+    };
+    renderFavorite();
+    favoriteButton.addEventListener("click", async (event) => {
+      event.stopPropagation();
+      favoriteButton.disabled = true;
+      try {
+        await saveListingUserData(item, { favorite: !item.user_data.favorite });
+        renderFavorite();
+      } catch (error) {
+        alert(error.message);
+      } finally {
+        favoriteButton.disabled = false;
+      }
+    });
+    const compareButton = card.querySelector(".car-compare");
+    compareButton.dataset.listingKey = listingKey(item);
+    compareButton.addEventListener("click", (event) => {
+      event.stopPropagation();
+      toggleComparison(item);
+    });
     const garageButton = card.querySelector(".car-garage");
     garageButton.textContent = item.garage_id ? "В гараже" : "+ В гараж";
     garageButton.disabled = Boolean(item.garage_id);
@@ -414,6 +598,7 @@ function renderCards(payload) {
     });
     container.append(card);
   }
+  renderComparisonSelection();
   state.pages = payload.pages;
   renderPagination();
 }
@@ -1710,6 +1895,8 @@ document.getElementById("knowledge-search").addEventListener(
   },
 );
 
+elements.brand.addEventListener("input", updateModelDatalist);
+
 for (const element of Object.values(elements)) {
   element.addEventListener(element.tagName === "INPUT" ? "input" : "change", scheduleRefresh);
 }
@@ -1731,24 +1918,18 @@ document.getElementById("reset").addEventListener("click", () => {
     updateMultiFilterSummary(element);
     element.open = false;
   }
+  updateModelDatalist();
   scheduleRefresh();
 });
 
 fetch("/api/meta")
   .then((response) => response.json())
-  .then(({ locations, brands, sources, attribute_options: attributeOptions }) => {
-    for (const value of locations) {
-      const option = document.createElement("option");
-      option.value = value;
-      option.textContent = value;
-      elements.location.append(option);
-    }
-    for (const value of brands) {
-      const option = document.createElement("option");
-      option.value = value;
-      option.textContent = value;
-      elements.brand.append(option);
-    }
+  .then(({ locations, brands, models, models_by_brand: groupedModels, sources, attribute_options: attributeOptions }) => {
+    modelsByBrand = groupedModels || {};
+    allModelOptions = models || [];
+    fillDatalist("location-options", locations || []);
+    fillDatalist("brand-options", brands || []);
+    fillDatalist("year-options", attributeOptions?.year || []);
     for (const value of sources || []) {
       const option = document.createElement("option");
       option.value = value;
@@ -1756,6 +1937,7 @@ fetch("/api/meta")
       elements.source.append(option);
     }
     restoreControlPreferences();
+    updateModelDatalist();
     setupMultiFilters(attributeOptions);
     if (["analytics", "knowledge", "sold", "garage"].includes(savedPreferences?.view)) {
       switchView(savedPreferences.view, false);
@@ -1790,6 +1972,7 @@ let carouselLoading = false;
 let carouselTotal = 0;
 let detailLoadToken = 0;
 let currentDetailItem = null;
+renderComparisonSelection();
 
 function renderFullscreenCarousel() {
   if (!imageLightbox.open || !carouselImages.length) return;
@@ -1962,6 +2145,57 @@ function appendCompatibleSpareParts(root, spareParts) {
   }
   section.append(header, offers);
   root.append(section);
+}
+
+function renderDetailMarketAnalytics(analytics) {
+  const root = document.getElementById("detail-market-metrics");
+  root.replaceChildren();
+  const position = document.getElementById("detail-market-position");
+  const title = document.getElementById("detail-market-title");
+  if (!analytics) {
+    title.textContent = "Статистика поколения";
+    position.textContent = "Недостаточно данных";
+    root.append(emptyNote("Для этого поколения статистика пока не накоплена."));
+    return;
+  }
+  const difference = analytics.price_difference_percent;
+  title.textContent = analytics.generation_limited
+    ? `${analytics.brand} ${analytics.model}, ${analytics.year_from}–${analytics.year_to} г.`
+    : `${analytics.brand} ${analytics.model}, все годы`;
+  position.textContent = marketPositionLabel(analytics);
+  position.className = difference == null
+    ? ""
+    : difference <= 0
+      ? "is-good"
+      : "is-high";
+  const metrics = [
+    ["В поколении", money.format(analytics.listings_count)],
+    ["Сейчас активно", money.format(analytics.active_count)],
+    ["Продано / снято", money.format(analytics.sold_count)],
+    ["Средняя цена", formatMoney(analytics.average_price)],
+    ["Медианная цена", formatMoney(analytics.median_price)],
+    ["Средняя цена продажи", analytics.average_sold_price == null ? "Нет данных" : formatMoney(analytics.average_sold_price)],
+  ];
+  for (const [label, value] of metrics) {
+    const row = document.createElement("div");
+    const caption = document.createElement("span");
+    caption.textContent = label;
+    const metric = document.createElement("strong");
+    metric.textContent = value;
+    row.append(caption, metric);
+    root.append(row);
+  }
+}
+
+function renderDetailUserData(item) {
+  item.user_data ||= { favorite: false, note: "" };
+  const favorite = document.getElementById("detail-favorite");
+  favorite.textContent = item.user_data.favorite ? "★ В избранном" : "☆ Добавить в избранное";
+  favorite.classList.toggle("is-selected", item.user_data.favorite);
+  const note = document.getElementById("detail-note");
+  if (document.activeElement !== note) note.value = item.user_data.note || "";
+  setText("detail-note-state", item.user_data.updated_at ? "Заметка сохранена" : "");
+  renderComparisonSelection();
 }
 
 function renderVehicleAnalysis(vehicleAnalysis, listingAssessment = null, spareParts = currentDetailItem?.spare_parts) {
@@ -2148,8 +2382,8 @@ function renderAnalysisTrimSelector(item) {
   select.replaceChildren();
   if (!names.length) {
     const option = document.createElement("option");
-    option.value = "";
-    option.textContent = "Комплектация не определена";
+    option.value = "__model__";
+    option.textContent = "Общий анализ модели";
     select.append(option);
     select.disabled = true;
     return;
@@ -2174,7 +2408,8 @@ function renderAnalysisTrimSelector(item) {
   }
   select.disabled = Boolean(item.trim_exact);
   select.onchange = () => {
-    if (select.value !== item.analysis_trim_name) {
+    const selectedAnalysis = select.value === "__model__" ? "" : select.value;
+    if (selectedAnalysis !== (item.analysis_trim_name || "")) {
       renderVehicleAnalysis(null, item.listing_assessment);
     } else {
       renderVehicleAnalysis(item.vehicle_analysis, item.listing_assessment);
@@ -2303,20 +2538,27 @@ function renderKnowledge(payload = state.knowledgePayload) {
 }
 
 function vehicleAnalysisPrompt(item) {
-  const trimName = document.getElementById("vehicle-analysis-trim").value;
+  const selectedTrim = document.getElementById("vehicle-analysis-trim").value;
+  const trimName = selectedTrim === "__model__" ? "" : selectedTrim;
   const vehicle = [
     item.brand,
     item.model,
     trimName,
   ].filter(Boolean).join(" ");
   const description = item.description?.trim() || "Описание продавца отсутствует.";
-  return `Проанализируй модель и комплектацию ${vehicle}. Сформируй общее описание для этой модели и комплектации без упоминания конкретного года выпуска. Учитывай российский рынок и естественное старение автомобиля.
+  const scope = trimName
+    ? `модель и комплектацию ${vehicle}`
+    : `модель ${vehicle} без уточнения комплектации`;
+  const sharedScope = trimName
+    ? "этой модели и комплектации"
+    : "этой модели в целом; особенности отдельных комплектаций явно помечай в тексте";
+  return `Проанализируй ${scope}. Сформируй общее описание без упоминания конкретного года выпуска. Учитывай российский рынок и естественное старение автомобиля.
 
 Описание конкретного объявления:
 """${description}"""
 
 Сформируй два независимых блока:
-1. model_analysis — полный справочник всех типовых слабых мест именно этой модели и комплектации. Не удаляй из него неисправности из-за заявлений продавца: этот блок будет общим только для автомобилей с той же маркой, моделью и комплектацией.
+1. model_analysis — полный справочник всех типовых слабых мест ${sharedScope}. Не удаляй из него неисправности из-за заявлений продавца: этот блок будет переиспользоваться для подходящих автомобилей.
 2. listing_assessment — оценка только этого объявления на основе текста продавца. Если в описании прямо сказано, что узел заменён или обслужен, добавь его ID в excluded_weak_point_ids, чтобы проблема не показывалась в этой карточке. Не считай расплывчатые фразы вроде «всё обслужено» подтверждением конкретного ТО.
 
 Указывай стоимость запчастей и работ раздельно в рублях. Для каждой неисправности обязательно заполняй repair_parts — связанный список конкретных компонентов, которые действительно устраняют именно эту неисправность. Не используй в качестве поисковых терминов общие слова «система», «охлаждение», «двигатель», «ремонт» или название симптома.
@@ -2445,6 +2687,8 @@ async function loadGallery(item, token) {
         analysis_trim_name: payload.analysis_trim_name,
         drive2_url: payload.drive2_url,
         vehicle_analysis: payload.vehicle_analysis,
+        market_analytics: payload.market_analytics,
+        user_data: payload.user_data,
         published_at: payload.published_at || item.published_at,
         published_at_inferred: payload.published_at_inferred,
       });
@@ -2456,6 +2700,8 @@ async function loadGallery(item, token) {
         item.vehicle_analysis,
         item.listing_assessment,
       );
+      renderDetailMarketAnalytics(item.market_analytics);
+      renderDetailUserData(item);
       const drive2 = document.getElementById("detail-drive2");
       drive2.hidden = !item.drive2_url;
       if (item.drive2_url) drive2.href = item.drive2_url;
@@ -2524,6 +2770,8 @@ function openDetails(item) {
   renderDetailTrims(item);
   renderAnalysisTrimSelector(item);
   renderVehicleAnalysis(item.vehicle_analysis, item.listing_assessment);
+  renderDetailMarketAnalytics(item.market_analytics);
+  renderDetailUserData(item);
   renderDetailSparePartsState(item.spare_parts);
   const drive2 = document.getElementById("detail-drive2");
   drive2.hidden = !item.drive2_url;
@@ -2615,15 +2863,158 @@ document.getElementById("detail-spare-parts-import").addEventListener(
   () => importSparePartsForCurrentCar(),
 );
 
+document.getElementById("detail-favorite").addEventListener("click", async () => {
+  if (!currentDetailItem) return;
+  const button = document.getElementById("detail-favorite");
+  button.disabled = true;
+  try {
+    await saveListingUserData(currentDetailItem, {
+      favorite: !currentDetailItem.user_data?.favorite,
+    });
+    renderDetailUserData(currentDetailItem);
+    refresh().catch(showError);
+  } catch (error) {
+    alert(error.message);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+document.getElementById("detail-compare").addEventListener("click", () => {
+  if (currentDetailItem) toggleComparison(currentDetailItem);
+});
+
+document.getElementById("detail-note-save").addEventListener("click", async () => {
+  if (!currentDetailItem) return;
+  const button = document.getElementById("detail-note-save");
+  button.disabled = true;
+  setText("detail-note-state", "Сохраняем…");
+  try {
+    await saveListingUserData(currentDetailItem, {
+      note: document.getElementById("detail-note").value,
+    });
+    setText("detail-note-state", "Заметка сохранена");
+  } catch (error) {
+    setText("detail-note-state", error.message);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+function comparisonValue(item, field) {
+  if (field === "price") return formatMoney(item.price);
+  if (field === "mileage_km") return formatMileage(item.mileage_km);
+  if (field === "market_average") return formatMoney(item.market_analytics?.average_price);
+  if (field === "market_position") {
+    const value = item.market_analytics?.price_difference_percent;
+    if (value == null) return "Нет данных";
+    return value === 0 ? "На уровне средней" : `${Math.abs(value)}% ${value < 0 ? "ниже" : "выше"} средней`;
+  }
+  if (field === "market_volume") {
+    const market = item.market_analytics;
+    return market ? `${market.listings_count} всего · ${market.active_count} активных · ${market.sold_count} продано` : "Нет данных";
+  }
+  return item[field] ?? "Не указано";
+}
+
+function renderComparison(items) {
+  const root = document.getElementById("comparison-content");
+  root.replaceChildren();
+  const table = document.createElement("table");
+  const head = document.createElement("thead");
+  const heading = document.createElement("tr");
+  const empty = document.createElement("th");
+  heading.append(empty);
+  for (const item of items) {
+    const cell = document.createElement("th");
+    if (item.thumbnail_url) {
+      const image = document.createElement("img");
+      image.src = item.thumbnail_url;
+      image.alt = "";
+      cell.append(image);
+    }
+    const title = document.createElement("a");
+    title.href = item.url;
+    title.target = "_blank";
+    title.rel = "noopener noreferrer";
+    title.textContent = item.title;
+    cell.append(title);
+    heading.append(cell);
+  }
+  head.append(heading);
+  table.append(head);
+  const body = document.createElement("tbody");
+  const rows = [
+    ["Цена", "price"],
+    ["Пробег", "mileage_km"],
+    ["Год", "year"],
+    ["Город", "location"],
+    ["Средняя цена поколения", "market_average"],
+    ["Позиция цены", "market_position"],
+    ["Объявления и продажи", "market_volume"],
+  ];
+  const attributeNames = [...new Set(items.flatMap((item) => Object.keys(item.attributes || {})))]
+    .filter((name) => name !== "Год выпуска" && name !== "Комплектация");
+  for (const [label, field] of rows) {
+    const row = document.createElement("tr");
+    const caption = document.createElement("th");
+    caption.textContent = label;
+    row.append(caption);
+    for (const item of items) {
+      const value = document.createElement("td");
+      value.textContent = comparisonValue(item, field);
+      row.append(value);
+    }
+    body.append(row);
+  }
+  for (const name of attributeNames) {
+    const row = document.createElement("tr");
+    const caption = document.createElement("th");
+    caption.textContent = name;
+    row.append(caption);
+    for (const item of items) {
+      const value = document.createElement("td");
+      value.textContent = item.attributes?.[name] || "Не указано";
+      row.append(value);
+    }
+    body.append(row);
+  }
+  table.append(body);
+  root.append(table);
+}
+
+document.getElementById("comparison-clear").addEventListener("click", () => {
+  comparisonSelection.clear();
+  renderComparisonSelection();
+});
+
+document.getElementById("comparison-open").addEventListener("click", async () => {
+  if (comparisonSelection.size !== 2) return;
+  const button = document.getElementById("comparison-open");
+  button.disabled = true;
+  try {
+    const query = new URLSearchParams();
+    for (const item of comparisonSelection.values()) {
+      query.append("source", item.source);
+      query.append("external_id", item.external_id);
+    }
+    const response = await fetch(`/api/comparison?${query}`);
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || "Не удалось сравнить автомобили");
+    renderComparison(payload.items);
+    document.getElementById("comparison-dialog").showModal();
+  } catch (error) {
+    alert(error.message);
+  } finally {
+    button.disabled = comparisonSelection.size !== 2;
+  }
+});
+
 document.getElementById("vehicle-prompt-copy").addEventListener(
   "click",
   async () => {
     if (!currentDetailItem) return;
     const button = document.getElementById("vehicle-prompt-copy");
-    if (!document.getElementById("vehicle-analysis-trim").value) {
-      alert("Сначала выберите комплектацию для анализа.");
-      return;
-    }
     const promptText = vehicleAnalysisPrompt(currentDetailItem);
     try {
       await navigator.clipboard.writeText(promptText);
@@ -2652,11 +3043,8 @@ document.getElementById("vehicle-analysis-save").addEventListener(
       alert("Ожидался JSON-объект анализа.");
       return;
     }
-    const trimName = document.getElementById("vehicle-analysis-trim").value;
-    if (!trimName) {
-      alert("Сначала выберите комплектацию для анализа.");
-      return;
-    }
+    const selectedTrim = document.getElementById("vehicle-analysis-trim").value;
+    const trimName = selectedTrim === "__model__" ? "" : selectedTrim;
     button.disabled = true;
     try {
       const response = await fetch("/api/vehicle-analysis", {

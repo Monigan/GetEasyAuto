@@ -914,6 +914,8 @@ class ViewerTests(unittest.TestCase):
                 "BMW X5",
             )
             self.assertIn("Volvo", meta["brands"])
+            self.assertIn("XC90", meta["models"])
+            self.assertIn("XC90", meta["models_by_brand"]["Volvo"])
             self.assertEqual(parts_cars["items"][0]["title"], "Volvo XC90")
             self.assertGreater(seeded_parts["created"], 0)
             self.assertGreater(parts_payload["analytics"]["offers_count"], 0)

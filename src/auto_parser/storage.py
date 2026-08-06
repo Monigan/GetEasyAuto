@@ -108,6 +108,18 @@ class ListingRepository:
                 ON displayed_listings(seen_at);
             CREATE INDEX IF NOT EXISTS displayed_listings_listing_idx
                 ON displayed_listings(source, external_id, seen_at);
+            CREATE TABLE IF NOT EXISTS listing_user_data (
+                source TEXT NOT NULL,
+                external_id TEXT NOT NULL,
+                favorite INTEGER NOT NULL DEFAULT 0,
+                note TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (source, external_id),
+                FOREIGN KEY(source, external_id) REFERENCES listings(source, external_id)
+                    ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS listing_user_data_favorite_idx
+                ON listing_user_data(favorite, updated_at DESC);
             CREATE TABLE IF NOT EXISTS vehicle_trims (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 brand_key TEXT NOT NULL,
@@ -945,7 +957,7 @@ class ListingRepository:
         *,
         trim_name: str | None,
     ) -> dict[str, Any] | None:
-        if not brand or not model or not trim_name:
+        if not brand or not model:
             return None
         row = self.connection.execute(
             """
@@ -969,7 +981,7 @@ class ListingRepository:
             "data": analysis,
             "updated_at": row["updated_at"],
             "trim_name": row["trim_name"],
-            "match_kind": "exact_trim",
+            "match_kind": "exact_trim" if trim_name else "model",
         }
 
     def save_vehicle_analysis(
@@ -987,8 +999,8 @@ class ListingRepository:
         brand_key = _vehicle_key(brand)
         model_key = _vehicle_key(model)
         trim_key = _vehicle_key(trim_name)
-        if not brand_key or not model_key or not trim_key:
-            raise ValueError("Для анализа нужны марка, модель и комплектация")
+        if not brand_key or not model_key:
+            raise ValueError("Для анализа нужны марка и модель")
         self.connection.execute(
             """
             INSERT INTO vehicle_analyses (
@@ -1014,6 +1026,53 @@ class ListingRepository:
             ),
         )
         self.connection.commit()
+
+    def listing_user_data(
+        self,
+        source: str,
+        external_id: str,
+    ) -> dict[str, Any]:
+        row = self.connection.execute(
+            """
+            SELECT favorite, note, updated_at
+            FROM listing_user_data
+            WHERE source = ? AND external_id = ?
+            """,
+            (source, external_id),
+        ).fetchone()
+        if row is None:
+            return {"favorite": False, "note": "", "updated_at": None}
+        return {
+            "favorite": bool(row["favorite"]),
+            "note": row["note"] or "",
+            "updated_at": row["updated_at"],
+        }
+
+    def save_listing_user_data(
+        self,
+        source: str,
+        external_id: str,
+        *,
+        favorite: bool,
+        note: str,
+        updated_at: str,
+    ) -> dict[str, Any]:
+        if self.get_listing(source, external_id) is None:
+            raise ValueError("Объявление не найдено")
+        self.connection.execute(
+            """
+            INSERT INTO listing_user_data (
+                source, external_id, favorite, note, updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(source, external_id) DO UPDATE SET
+                favorite = excluded.favorite,
+                note = excluded.note,
+                updated_at = excluded.updated_at
+            """,
+            (source, external_id, int(favorite), note, updated_at),
+        )
+        self.connection.commit()
+        return self.listing_user_data(source, external_id)
 
     def upsert_spare_part_offers(
         self,
@@ -1268,7 +1327,7 @@ class ListingRepository:
         limit: int | None = None,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
-        conditions = ["trim_key != ''"]
+        conditions = ["1 = 1"]
         values: list[Any] = []
         if search.strip():
             conditions.append(
@@ -1303,7 +1362,8 @@ class ListingRepository:
                 {
                     "brand": row["brand"],
                     "model": row["model"],
-                    "trim_name": row["trim_name"],
+                    "trim_name": row["trim_name"] or "Общий анализ модели",
+                    "model_level": not bool(row["trim_name"]),
                     "analysis": analysis,
                     "updated_at": row["updated_at"],
                 }

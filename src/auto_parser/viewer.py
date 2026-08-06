@@ -182,6 +182,92 @@ def _top_distribution(
     ]
 
 
+def _model_market_analytics(
+    connection: sqlite3.Connection,
+    brand: str | None,
+    model: str | None,
+    *,
+    year: int | None = None,
+    current_price: int | None = None,
+) -> dict[str, Any] | None:
+    if not brand or not model or year is None:
+        return None
+    rows = connection.execute(
+        """
+        SELECT status, price, sold_price, title, attributes_json
+        FROM listings
+        WHERE LOWER(COALESCE(brand, '')) = LOWER(?)
+          AND LOWER(COALESCE(model, '')) = LOWER(?)
+        """,
+        (brand, model),
+    ).fetchall()
+    year_from = year - 3
+    year_to = year + 3
+    unknown_year_count = 0
+    generation_rows = []
+    for row in rows:
+        listing_year = _listing_year(row, _row_attributes(row))
+        if listing_year is None:
+            unknown_year_count += 1
+            continue
+        if year_from <= listing_year <= year_to:
+            generation_rows.append(row)
+    rows = generation_rows
+    if not rows:
+        return None
+    active_rows = [row for row in rows if row["status"] == "active"]
+    sold_rows = [row for row in rows if row["status"] == "sold"]
+    active_prices = [
+        row["price"] for row in active_rows if row["price"] is not None
+    ]
+    all_prices = [row["price"] for row in rows if row["price"] is not None]
+    sold_prices = [
+        row["sold_price"] if row["sold_price"] is not None else row["price"]
+        for row in sold_rows
+        if row["sold_price"] is not None or row["price"] is not None
+    ]
+    reference_prices = active_prices or all_prices
+    average_price = (
+        round(statistics.fmean(reference_prices))
+        if reference_prices
+        else None
+    )
+    return {
+        "brand": brand,
+        "model": model,
+        "reference_year": year,
+        "year_from": year_from,
+        "year_to": year_to,
+        "generation_limited": True,
+        "unknown_year_count": unknown_year_count,
+        "listings_count": len(rows),
+        "active_count": len(active_rows),
+        "sold_count": len(sold_rows),
+        "has_sales": bool(sold_rows),
+        "average_price": average_price,
+        "median_price": (
+            round(statistics.median(reference_prices))
+            if reference_prices
+            else None
+        ),
+        "min_price": min(reference_prices) if reference_prices else None,
+        "max_price": max(reference_prices) if reference_prices else None,
+        "average_sold_price": (
+            round(statistics.fmean(sold_prices)) if sold_prices else None
+        ),
+        "price_difference": (
+            current_price - average_price
+            if current_price is not None and average_price is not None
+            else None
+        ),
+        "price_difference_percent": (
+            round((current_price - average_price) / average_price * 100, 1)
+            if current_price is not None and average_price
+            else None
+        ),
+    }
+
+
 class ViewerHandler(
     GarageApiMixin,
     PartsApiMixin,
@@ -262,6 +348,8 @@ class ViewerHandler(
             self._search_profiles()
         elif parsed.path == "/api/vehicle-analyses":
             self._vehicle_analyses(parse_qs(parsed.query))
+        elif parsed.path == "/api/comparison":
+            self._comparison(parse_qs(parsed.query))
         elif parsed.path == "/api/parts/cars":
             self._parts_cars()
         elif parsed.path == "/api/parts":
@@ -347,6 +435,13 @@ class ViewerHandler(
             and parts[4] == "sale"
         ):
             self._set_listing_sale(parts[2], parts[3])
+            return
+        if (
+            len(parts) == 5
+            and parts[:2] == ["api", "listings"]
+            and parts[4] == "user-data"
+        ):
+            self._set_listing_user_data(parts[2], parts[3])
             return
         if len(parts) == 3 and parts[:2] == ["api", "search-profiles"]:
             self._update_search_profile(_integer(parts[2]))
@@ -449,6 +544,9 @@ class ViewerHandler(
             ).fetchall()
         items = []
         with ListingRepository(self.database) as repository:
+            analytics_cache: dict[
+                tuple[str, str, int | None], dict[str, Any] | None
+            ] = {}
             for row in rows:
                 item = dict(row)
                 try:
@@ -505,6 +603,47 @@ class ViewerHandler(
                         item["source"],
                         item["external_id"],
                     )
+                )
+                item["user_data"] = repository.listing_user_data(
+                    item["source"],
+                    item["external_id"],
+                )
+                analytics_key = (
+                    str(item.get("brand") or "").casefold(),
+                    str(item.get("model") or "").casefold(),
+                    year,
+                )
+                if analytics_key not in analytics_cache:
+                    analytics_cache[analytics_key] = _model_market_analytics(
+                        repository.connection,
+                        item.get("brand"),
+                        item.get("model"),
+                        year=year,
+                    )
+                model_analytics = analytics_cache[analytics_key]
+                item["market_analytics"] = (
+                    {
+                        **model_analytics,
+                        "price_difference": (
+                            item["price"] - model_analytics["average_price"]
+                            if item.get("price") is not None
+                            and model_analytics.get("average_price") is not None
+                            else None
+                        ),
+                        "price_difference_percent": (
+                            round(
+                                (item["price"] - model_analytics["average_price"])
+                                / model_analytics["average_price"]
+                                * 100,
+                                1,
+                            )
+                            if item.get("price") is not None
+                            and model_analytics.get("average_price")
+                            else None
+                        ),
+                    }
+                    if model_analytics
+                    else None
                 )
                 item["spare_parts"] = listing_spare_parts_payload(
                     repository,
@@ -708,7 +847,8 @@ class ViewerHandler(
             }
             if exact_trim:
                 allowed_trims.add(exact_trim)
-            if not trim_name or trim_name not in allowed_trims:
+            general_model_analysis = not trim_name and not exact_trim
+            if not general_model_analysis and trim_name not in allowed_trims:
                 self._json(
                     {"error": "Выберите подтверждённую комплектацию"},
                     HTTPStatus.BAD_REQUEST,
@@ -720,7 +860,7 @@ class ViewerHandler(
                     HTTPStatus.BAD_REQUEST,
                 )
                 return
-            if not exact_trim:
+            if not exact_trim and trim_name:
                 repository.set_listing_trim_assignment(
                     source,
                     external_id,
@@ -763,6 +903,103 @@ class ViewerHandler(
                 ),
             }
         )
+
+    def _set_listing_user_data(
+        self,
+        source: str,
+        external_id: str,
+    ) -> None:
+        payload = self._read_json()
+        if payload is None:
+            return
+        if source not in {"avito", "auto_ru", "drom"} or not external_id:
+            self._json({"error": "Некорректное объявление"}, HTTPStatus.BAD_REQUEST)
+            return
+        with ListingRepository(self.database) as repository:
+            current = repository.listing_user_data(source, external_id)
+            favorite = payload.get("favorite", current["favorite"])
+            note = payload.get("note", current["note"])
+            if not isinstance(favorite, bool) or not isinstance(note, str):
+                self._json(
+                    {"error": "Ожидались признак избранного и текст заметки"},
+                    HTTPStatus.BAD_REQUEST,
+                )
+                return
+            note = note.strip()
+            if len(note) > 5000:
+                self._json(
+                    {"error": "Заметка не должна превышать 5000 символов"},
+                    HTTPStatus.BAD_REQUEST,
+                )
+                return
+            try:
+                saved = repository.save_listing_user_data(
+                    source,
+                    external_id,
+                    favorite=favorite,
+                    note=note,
+                    updated_at=utc_now_iso(),
+                )
+            except ValueError as error:
+                self._json({"error": str(error)}, HTTPStatus.NOT_FOUND)
+                return
+        self._json(saved)
+
+    def _comparison(self, query: dict[str, list[str]]) -> None:
+        sources = query.get("source", [])
+        external_ids = query.get("external_id", [])
+        keys = list(dict.fromkeys(zip(sources, external_ids)))
+        if len(keys) != 2 or any(
+            source not in {"avito", "auto_ru", "drom"} or not external_id
+            for source, external_id in keys
+        ):
+            self._json(
+                {"error": "Для сравнения выберите два объявления"},
+                HTTPStatus.BAD_REQUEST,
+            )
+            return
+        items = []
+        with ListingRepository(self.database) as repository:
+            for source, external_id in keys:
+                row = repository.connection.execute(
+                    """
+                    SELECT l.*,
+                        (SELECT COUNT(*) FROM listing_images i
+                         WHERE i.source = l.source
+                           AND i.external_id = l.external_id
+                           AND i.local_path IS NOT NULL) AS image_count
+                    FROM listings l
+                    WHERE l.source = ? AND l.external_id = ?
+                    """,
+                    (source, external_id),
+                ).fetchone()
+                if row is None:
+                    self._json(
+                        {"error": "Одно из объявлений больше не найдено"},
+                        HTTPStatus.NOT_FOUND,
+                    )
+                    return
+                item = dict(row)
+                item["attributes"] = _row_attributes(row)
+                item.pop("attributes_json", None)
+                item["year"] = _listing_year(row, item["attributes"])
+                item["thumbnail_url"] = (
+                    f"/media/{source}/{external_id}/0"
+                    if item.pop("image_count")
+                    else None
+                )
+                item["user_data"] = repository.listing_user_data(
+                    source, external_id
+                )
+                item["market_analytics"] = _model_market_analytics(
+                    repository.connection,
+                    item.get("brand"),
+                    item.get("model"),
+                    year=item.get("year"),
+                    current_price=item.get("price"),
+                )
+                items.append(item)
+        self._json({"items": items})
 
     def _vehicle_analyses(self, query: dict[str, list[str]]) -> None:
         page = _integer(query.get("page", ["1"])[0], minimum=1) or 1
@@ -1645,6 +1882,13 @@ class ViewerHandler(
                     """
                 )
             ]
+            model_rows = connection.execute(
+                """
+                SELECT DISTINCT brand, model FROM listings
+                WHERE model IS NOT NULL AND model != ''
+                ORDER BY brand COLLATE NOCASE, model COLLATE NOCASE
+                """
+            ).fetchall()
             sources = [
                 row[0]
                 for row in connection.execute(
@@ -1661,6 +1905,16 @@ class ViewerHandler(
         attribute_values: dict[str, set[str]] = {
             parameter: set() for parameter in ATTRIBUTE_FILTERS
         }
+        models_by_brand: dict[str, list[str]] = defaultdict(list)
+        all_models: set[str] = set()
+        for row in model_rows:
+            brand = _repair_legacy_text(row["brand"])
+            model = _repair_legacy_text(row["model"])
+            if not model:
+                continue
+            all_models.add(model)
+            if brand and model not in models_by_brand[brand]:
+                models_by_brand[brand].append(model)
         attribute_parameters = {
             attribute_name: parameter
             for parameter, attribute_name in ATTRIBUTE_FILTERS.items()
@@ -1694,6 +1948,11 @@ class ViewerHandler(
                 "schema_version": SCHEMA_VERSION,
                 "locations": locations,
                 "brands": brands,
+                "models": sorted(all_models, key=str.casefold),
+                "models_by_brand": {
+                    brand: sorted(models, key=str.casefold)
+                    for brand, models in models_by_brand.items()
+                },
                 "sources": sources,
                 "attribute_options": {
                     parameter: sorted(
@@ -2090,6 +2349,17 @@ class ViewerHandler(
                         external_id,
                     )
                 )
+                user_data = repository.listing_user_data(
+                    source_name,
+                    external_id,
+                )
+                market_analytics = _model_market_analytics(
+                    repository.connection,
+                    refreshed.brand if refreshed else None,
+                    refreshed.model if refreshed else None,
+                    year=refreshed_year,
+                    current_price=refreshed.price if refreshed else None,
+                )
         except OSError as error:
             if activity_started:
                 clear_listing_activity(
@@ -2159,6 +2429,8 @@ class ViewerHandler(
                 ),
                 "vehicle_analysis": vehicle_analysis,
                 "listing_assessment": listing_assessment,
+                "user_data": user_data,
+                "market_analytics": market_analytics,
                 "warning": warning,
             }
         )
