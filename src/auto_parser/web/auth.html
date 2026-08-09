@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Вход и регистрация в AutoScope">
+    <title>Вход — AutoScope</title>
+    <link rel="stylesheet" href="/auth.css">
+  </head>
+  <body>
+    <main class="auth-shell">
+      <section class="auth-story" aria-label="О сервисе AutoScope">
+        <a class="brand" href="/">
+          <span class="brand-mark">A</span>
+          <span>AutoScope</span>
+        </a>
+        <div class="story-copy">
+          <p class="eyebrow">Автомобильный рынок под контролем</p>
+          <h1>Находите хороший автомобиль раньше других.</h1>
+          <p>Объявления, история цен и аналитика рынка — в одном персональном пространстве.</p>
+          <ul>
+            <li><span>01</span> Собирайте интересные автомобили</li>
+            <li><span>02</span> Следите за ценой и статусом</li>
+            <li><span>03</span> Принимайте решение на основе данных</li>
+          </ul>
+        </div>
+        <div class="road" aria-hidden="true"><i></i><i></i><i></i></div>
+        <p class="story-foot">Ваши данные хранятся в локальной базе AutoScope.</p>
+      </section>
+
+      <section class="auth-panel">
+        <div class="auth-card">
+          <div class="mobile-brand">
+            <span class="brand-mark">A</span><strong>AutoScope</strong>
+          </div>
+          <div class="auth-tabs" role="tablist" aria-label="Способ входа">
+            <button class="auth-tab active" type="button" role="tab" aria-selected="true" data-mode="login">Вход</button>
+            <button class="auth-tab" type="button" role="tab" aria-selected="false" data-mode="register">Регистрация</button>
+          </div>
+
+          <div class="form-heading">
+            <p class="eyebrow" id="form-eyebrow">С возвращением</p>
+            <h2 id="form-title">Войдите в аккаунт</h2>
+            <p id="form-subtitle">Продолжите работу со своими подборками и аналитикой.</p>
+          </div>
+
+          <div id="auth-message" class="auth-message" role="status" aria-live="polite" hidden></div>
+
+          <form id="login-form" novalidate>
+            <label>
+              <span>Электронная почта</span>
+              <input name="email" type="email" autocomplete="email" placeholder="name@example.ru" required>
+            </label>
+            <label>
+              <span>Пароль</span>
+              <span class="password-field">
+                <input name="password" type="password" autocomplete="current-password" placeholder="Введите пароль" required>
+                <button class="password-toggle" type="button" aria-label="Показать пароль">Показать</button>
+              </span>
+            </label>
+            <button class="submit-button" type="submit"><span>Войти в AutoScope</span><b aria-hidden="true">→</b></button>
+          </form>
+
+          <form id="register-form" novalidate hidden>
+            <label>
+              <span>Ваше имя</span>
+              <input name="name" autocomplete="name" placeholder="Как к вам обращаться" minlength="2" required>
+            </label>
+            <label>
+              <span>Электронная почта</span>
+              <input name="email" type="email" autocomplete="email" placeholder="name@example.ru" required>
+            </label>
+            <label>
+              <span>Пароль</span>
+              <span class="password-field">
+                <input name="password" type="password" autocomplete="new-password" placeholder="Не менее 8 символов" minlength="8" required>
+                <button class="password-toggle" type="button" aria-label="Показать пароль">Показать</button>
+              </span>
+            </label>
+            <label class="agreement">
+              <input name="agreement" type="checkbox" required>
+              <span>Я согласен с условиями использования сервиса</span>
+            </label>
+            <button class="submit-button" type="submit"><span>Создать аккаунт</span><b aria-hidden="true">→</b></button>
+          </form>
+
+          <p class="auth-note">Защищённая сессия · Пароли не хранятся в открытом виде</p>
+        </div>
+      </section>
+    </main>
+    <script type="module" src="/auth.js"></script>
+  </body>
+</html>

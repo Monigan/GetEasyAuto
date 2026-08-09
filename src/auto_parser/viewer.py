@@ -9,6 +9,8 @@ import re
 import sqlite3
 import statistics
 import time
+import secrets
+import sqlite3
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
@@ -50,8 +52,14 @@ from auto_parser.viewer_query import (
     open_database as _open_database,
 )
 from auto_parser.viewer_security import (
+    SESSION_COOKIE,
+    authenticate_user,
     authorize_request,
+    create_session,
+    create_user,
     resolve_password,
+    session_user,
+    user_count,
     validate_remote_access,
 )
 
@@ -277,6 +285,7 @@ class ViewerHandler(
     database: Path
     cache_dir: Path
     viewer_password: str | None = None
+    session_secret: bytes = secrets.token_bytes(32)
 
     def handle(self) -> None:
         try:
@@ -323,9 +332,15 @@ class ViewerHandler(
         super().end_headers()
 
     def do_GET(self) -> None:
-        if not authorize_request(self, self.viewer_password):
-            return
         parsed = urlparse(self.path)
+        if parsed.path == "/api/auth/status":
+            self._auth_status()
+            return
+        if parsed.path in {"/auth", "/auth.html", "/auth.css", "/auth.js"}:
+            self._static("/auth.html" if parsed.path == "/auth" else parsed.path)
+            return
+        if not self._request_authorized():
+            return
         if self._garage_get_route(parsed.path):
             return
         if self._notification_get_route(parsed.path):
@@ -362,9 +377,18 @@ class ViewerHandler(
             self._static(parsed.path)
 
     def do_POST(self) -> None:
-        if not authorize_request(self, self.viewer_password):
-            return
         parsed = urlparse(self.path)
+        if parsed.path == "/api/auth/register":
+            self._auth_register()
+            return
+        if parsed.path == "/api/auth/login":
+            self._auth_login()
+            return
+        if parsed.path == "/api/auth/logout":
+            self._auth_logout()
+            return
+        if not self._request_authorized():
+            return
         if self._garage_post_route(parsed.path):
             return
         if self._notification_post_route(parsed.path):
@@ -414,7 +438,7 @@ class ViewerHandler(
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_PATCH(self) -> None:
-        if not authorize_request(self, self.viewer_password):
+        if not self._request_authorized():
             return
         path = urlparse(self.path).path
         if self._garage_patch_route(path):
@@ -452,7 +476,7 @@ class ViewerHandler(
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_DELETE(self) -> None:
-        if not authorize_request(self, self.viewer_password):
+        if not self._request_authorized():
             return
         path = urlparse(self.path).path
         if self._garage_delete_route(path):
@@ -473,6 +497,90 @@ class ViewerHandler(
             self._delete_part(_integer(parts[2]))
             return
         self.send_error(HTTPStatus.NOT_FOUND)
+
+    def _request_authorized(self) -> bool:
+        if session_user(self.headers.get("Cookie"), self.session_secret):
+            return True
+        if self.viewer_password:
+            return authorize_request(self, self.viewer_password)
+        if user_count(self.database) == 0:
+            return True
+        if urlparse(self.path).path.startswith("/api/"):
+            self._json({"error": "Требуется авторизация"}, HTTPStatus.UNAUTHORIZED)
+        else:
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", "/auth.html")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        return False
+
+    def _auth_status(self) -> None:
+        user = session_user(self.headers.get("Cookie"), self.session_secret)
+        self._json(
+            {
+                "authenticated": user is not None,
+                "user": user,
+                "auth_required": bool(self.viewer_password) or user_count(self.database) > 0,
+            }
+        )
+
+    def _set_auth_cookie(self, user: dict[str, object]) -> None:
+        token = create_session(user, self.session_secret)
+        self.send_header(
+            "Set-Cookie",
+            f"{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000",
+        )
+
+    def _auth_register(self) -> None:
+        payload = self._read_json() or {}
+        name = str(payload.get("name", "")).strip()
+        email = str(payload.get("email", "")).strip()
+        password = str(payload.get("password", ""))
+        if len(name) < 2 or "@" not in email or len(password) < 8:
+            self._json(
+                {"error": "Укажите имя, корректную почту и пароль от 8 символов"},
+                HTTPStatus.BAD_REQUEST,
+            )
+            return
+        try:
+            user = create_user(self.database, name, email, password)
+        except sqlite3.IntegrityError:
+            self._json({"error": "Пользователь с такой почтой уже существует"}, HTTPStatus.CONFLICT)
+            return
+        body = json.dumps({"user": user}, ensure_ascii=False).encode("utf-8")
+        self.send_response(HTTPStatus.CREATED)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self._set_auth_cookie(user)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _auth_login(self) -> None:
+        payload = self._read_json() or {}
+        email = str(payload.get("email", "")).strip()
+        password = str(payload.get("password", ""))
+        user = authenticate_user(self.database, email, password)
+        if user is None and self.viewer_password and secrets.compare_digest(password, self.viewer_password):
+            user = {"id": 0, "name": "Администратор", "email": email or "admin@autoscope.local"}
+        if user is None:
+            self._json({"error": "Неверная почта или пароль"}, HTTPStatus.UNAUTHORIZED)
+            return
+        body = json.dumps({"user": user}, ensure_ascii=False).encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self._set_auth_cookie(user)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _auth_logout(self) -> None:
+        body = b'{"ok":true}'
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Set-Cookie", f"{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _json(self, payload: Any, status: HTTPStatus = HTTPStatus.OK) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
