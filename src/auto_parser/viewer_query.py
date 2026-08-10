@@ -38,6 +38,20 @@ ATTRIBUTE_FILTERS = {
 }
 
 
+def normalize_text(value: Any) -> str:
+    """Return comparable text, repairing values saved by the legacy importer."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        repaired = text.encode("latin1").decode("cp1251")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        repaired = text
+    original_cyrillic = sum("а" <= char.casefold() <= "я" or char.casefold() == "ё" for char in text)
+    repaired_cyrillic = sum("а" <= char.casefold() <= "я" or char.casefold() == "ё" for char in repaired)
+    return (repaired if repaired_cyrillic > original_cyrillic else text).casefold()
+
+
 def integer(value: str | None, *, minimum: int = 0) -> int | None:
     if value in {None, ""}:
         return None
@@ -97,14 +111,14 @@ def build_filters(
             values.append(value)
 
     for name, expression in (
-        ("location", "LOWER(COALESCE(l.location, '')) LIKE ?"),
-        ("brand", "LOWER(COALESCE(l.brand, '')) LIKE ?"),
-        ("model", "LOWER(COALESCE(l.model, '')) LIKE ?"),
+        ("location", "NORMALIZE_TEXT(l.location) LIKE ?"),
+        ("brand", "NORMALIZE_TEXT(l.brand) LIKE ?"),
+        ("model", "NORMALIZE_TEXT(l.model) LIKE ?"),
     ):
         value = query.get(name, [""])[0].strip()
         if value:
             conditions.append(expression)
-            values.append(f"%{value.casefold()}%")
+            values.append(f"%{normalize_text(value)}%")
 
     for name, expression in (
         ("source", "l.source = ?"),
@@ -165,6 +179,7 @@ def build_filters(
 def open_database(path: Path) -> Iterator[sqlite3.Connection]:
     connection = sqlite3.connect(path, timeout=10)
     connection.row_factory = sqlite3.Row
+    connection.create_function("NORMALIZE_TEXT", 1, normalize_text, deterministic=True)
     configure_sqlite_connection(connection)
     try:
         yield connection

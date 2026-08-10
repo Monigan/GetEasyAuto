@@ -77,7 +77,7 @@ class ViewerTests(unittest.TestCase):
             handler = type(
                 "InvalidJsonViewerHandler",
                 (ViewerHandler,),
-                {"database": database, "cache_dir": cache},
+                {"database": database, "cache_dir": cache, "_is_authenticated": lambda self: True},
             )
             server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -138,7 +138,7 @@ class ViewerTests(unittest.TestCase):
             handler = type(
                 "TestVehicleKnowledgeViewerHandler",
                 (ViewerHandler,),
-                {"database": database, "cache_dir": cache},
+                {"database": database, "cache_dir": cache, "_is_authenticated": lambda self: True},
             )
             server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -260,7 +260,7 @@ class ViewerTests(unittest.TestCase):
             handler = type(
                 "TestDisplayedViewerHandler",
                 (ViewerHandler,),
-                {"database": database, "cache_dir": cache},
+                {"database": database, "cache_dir": cache, "_is_authenticated": lambda self: True},
             )
             server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -359,7 +359,7 @@ class ViewerTests(unittest.TestCase):
             handler = type(
                 "TestSoldViewerHandler",
                 (ViewerHandler,),
-                {"database": database, "cache_dir": cache},
+                {"database": database, "cache_dir": cache, "_is_authenticated": lambda self: True},
             )
             server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -500,7 +500,7 @@ class ViewerTests(unittest.TestCase):
             handler = type(
                 "TestViewerHandler",
                 (ViewerHandler,),
-                {"database": database, "cache_dir": cache},
+                {"database": database, "cache_dir": cache, "_is_authenticated": lambda self: True},
             )
             server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
             server.daemon_threads = False

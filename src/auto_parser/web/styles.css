@@ -20,6 +20,8 @@
 
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
+[data-auth-required] { transition: opacity .15s ease; }
+body:not(.is-authenticated) [data-auth-required] { display: none !important; }
 
 body {
   margin: 0;
@@ -1870,29 +1872,32 @@ input:focus, select:focus {
 }
 
 @media (max-width: 640px) {
-  html { scroll-padding-top: 180px; }
+  html { scroll-padding-top: 132px; }
   .topbar {
-    grid-template-columns: 1fr;
+    grid-template-columns: auto minmax(0, 1fr);
     grid-template-areas:
-      "brand"
-      "actions"
-      "nav";
-    gap: 7px;
+      "brand actions"
+      "nav nav";
+    gap: 8px 12px;
     padding-top: max(9px, env(safe-area-inset-top));
   }
-  .brand { justify-self: center; }
+  .brand { justify-self: start; }
   .brand > span:last-child { display: inline; }
   .topbar-actions {
-    width: 100%;
-    justify-self: stretch;
-    display: grid;
-    grid-template-columns: 1fr 1fr;
+    width: auto;
+    max-width: 100%;
+    justify-self: end;
+    display: flex;
     gap: 8px;
+    overflow-x: auto;
+    scrollbar-width: none;
   }
-  .topbar-actions > button { width: 100%; min-width: 0; padding-inline: 10px; }
+  .topbar-actions::-webkit-scrollbar { display: none; }
+  .topbar-actions > * { flex: 0 0 auto; min-width: 0; padding-inline: 11px; }
   .notification-button, .topbar-actions .primary-button { font-size: 12px; }
-  .primary-nav { padding-bottom: 2px; }
-  .nav-button { flex: 1 0 auto; padding-inline: 14px; }
+  .primary-nav { padding: 3px; }
+  .nav-button { flex: 0 0 auto; padding-inline: 14px; }
+  .nav-button:only-child { flex: 1; }
   .app-shell { width: calc(100% - 20px); }
   .page-intro { min-height: 0; margin: 12px 0; padding: 20px; }
   .page-intro h1 { overflow-wrap: anywhere; }

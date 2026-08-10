@@ -21,6 +21,7 @@ const state = {
   view: "catalog",
   activeProfileId: null,
   activeProfileLabel: "",
+  authenticated: false,
 };
 const ids = [
   "search", "min-price", "max-price", "min-mileage",
@@ -133,6 +134,39 @@ const multiFilterState = new Map(
 );
 const garageController = createGarageController();
 const notificationCenter = createNotificationCenter();
+
+async function configureAuthentication() {
+  const response = await fetch("/api/auth/status");
+  if (!response.ok) throw new Error("Не удалось проверить авторизацию");
+  const status = await response.json();
+  state.authenticated = Boolean(status.authenticated);
+  document.body.classList.toggle("is-authenticated", state.authenticated);
+  for (const element of document.querySelectorAll("[data-auth-required]")) {
+    element.hidden = !state.authenticated;
+  }
+  const accountLink = document.querySelector(".account-link");
+  accountLink.textContent = state.authenticated ? "Выйти" : "Войти";
+  accountLink.href = state.authenticated ? "#logout" : "/auth.html";
+  accountLink.setAttribute(
+    "aria-label",
+    state.authenticated ? `Выйти из аккаунта ${status.user?.name || ""}`.trim() : "Войти в аккаунт",
+  );
+  if (state.authenticated) {
+    accountLink.addEventListener("click", async (event) => {
+      event.preventDefault();
+      accountLink.setAttribute("aria-busy", "true");
+      try {
+        const logout = await fetch("/api/auth/logout", { method: "POST" });
+        if (!logout.ok) throw new Error("Не удалось выйти из аккаунта");
+        globalThis.location.assign("/");
+      } catch (error) {
+        accountLink.removeAttribute("aria-busy");
+        alert(error.message);
+      }
+    });
+  }
+  return status;
+}
 
 function listingKey(item) {
   return `${item.source}:${item.external_id}`;
@@ -1771,7 +1805,7 @@ async function refresh() {
 }
 
 async function pollActivity() {
-  if (document.hidden) return;
+  if (document.hidden || !state.authenticated) return;
   try {
     const response = await fetch("/api/refresh-activity");
     if (!response.ok) throw new Error("Не удалось прочитать фоновые операции");
@@ -1838,6 +1872,10 @@ function showError(error) {
 }
 
 function switchView(view, shouldRefresh = true) {
+  if (view !== "catalog" && !state.authenticated) {
+    globalThis.location.assign("/auth.html");
+    return;
+  }
   if (!["catalog", "analytics", "knowledge", "spare-parts", "sold", "garage"].includes(view) || state.view === view) return;
   state.view = view;
   if (view !== "catalog") reportDisplayedListings([], true);
@@ -1922,7 +1960,8 @@ document.getElementById("reset").addEventListener("click", () => {
   scheduleRefresh();
 });
 
-fetch("/api/meta")
+configureAuthentication()
+  .then(() => fetch("/api/meta"))
   .then((response) => response.json())
   .then(({ locations, brands, models, models_by_brand: groupedModels, sources, attribute_options: attributeOptions }) => {
     modelsByBrand = groupedModels || {};
@@ -1939,13 +1978,13 @@ fetch("/api/meta")
     restoreControlPreferences();
     updateModelDatalist();
     setupMultiFilters(attributeOptions);
-    if (["analytics", "knowledge", "sold", "garage"].includes(savedPreferences?.view)) {
+    if (state.authenticated && ["analytics", "knowledge", "spare-parts", "sold", "garage"].includes(savedPreferences?.view)) {
       switchView(savedPreferences.view, false);
     }
     savePreferences();
   })
-  .then(() => garageController.init())
-  .then(() => notificationCenter.init())
+  .then(() => state.authenticated ? garageController.init() : undefined)
+  .then(() => state.authenticated ? notificationCenter.init() : undefined)
   .then(refresh)
   .then(() => {
     pollActivity();
@@ -2779,9 +2818,13 @@ function openDetails(item) {
   carouselImages = [...new Set(item.images || [])];
   carouselIndex = 0;
   carouselTotal = 0;
-  carouselLoading = true;
+  carouselLoading = state.authenticated;
   renderCarousel();
   detailsDialog.showModal();
+  if (!state.authenticated) {
+    setText("detail-load-status", "Показаны доступные данные объявления.");
+    return Promise.resolve();
+  }
   return loadGallery(item, token);
 }
 

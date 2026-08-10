@@ -13,7 +13,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(defaults.search_limit, 200)
         self.assertEqual(defaults.search_pages, 0)
         self.assertEqual(defaults.source, "avito")
-        self.assertIsNone(defaults.viewer_password)
+        self.assertFalse(hasattr(defaults, "viewer_password"))
         self.assertEqual(
             parser.parse_args(["BMW E39", "--source", "auto_ru"]).source,
             "auto_ru",

@@ -1,4 +1,3 @@
-import base64
 import json
 import tempfile
 import threading
@@ -11,34 +10,18 @@ from urllib.request import Request, urlopen
 from auto_parser.models import Listing, utc_now_iso
 from auto_parser.storage import ListingRepository
 from auto_parser.viewer import ViewerHandler
-from auto_parser.viewer_security import (
-    request_is_authorized,
-    validate_remote_access,
-)
+from auto_parser.viewer_security import validate_remote_access
 
 
 class ViewerSecurityTests(unittest.TestCase):
-    def test_remote_access_requires_flag_and_password(self) -> None:
+    def test_remote_access_requires_explicit_flag(self) -> None:
         with self.assertRaisesRegex(ValueError, "allow-remote-viewer"):
             validate_remote_access(
-                "0.0.0.0", allow_remote=False, password="secret"
+                "0.0.0.0", allow_remote=False
             )
-        with self.assertRaisesRegex(ValueError, "пароль"):
-            validate_remote_access(
-                "0.0.0.0", allow_remote=True, password=None
-            )
-        validate_remote_access(
-            "0.0.0.0", allow_remote=True, password="secret"
-        )
+        validate_remote_access("0.0.0.0", allow_remote=True)
 
-    def test_supports_basic_and_bearer_credentials(self) -> None:
-        basic = base64.b64encode(b"autoscope:secret").decode("ascii")
-        self.assertTrue(request_is_authorized(f"Basic {basic}", "secret"))
-        self.assertTrue(request_is_authorized("Bearer secret", "secret"))
-        self.assertFalse(request_is_authorized("Bearer wrong", "secret"))
-        self.assertFalse(request_is_authorized("Basic invalid", "secret"))
-
-    def test_password_protects_api(self) -> None:
+    def test_guest_can_read_catalog_but_not_private_api(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             database = root / "listings.db"
@@ -52,7 +35,6 @@ class ViewerSecurityTests(unittest.TestCase):
                 {
                     "database": database,
                     "cache_dir": cache,
-                    "viewer_password": "secret",
                 },
             )
             server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
@@ -60,24 +42,16 @@ class ViewerSecurityTests(unittest.TestCase):
             thread.start()
             base_url = f"http://127.0.0.1:{server.server_port}"
             try:
-                with self.assertRaises(HTTPError) as raised:
-                    urlopen(f"{base_url}/api/meta", timeout=5)
-                raised.exception.close()
-                credentials = base64.b64encode(
-                    b"autoscope:secret"
-                ).decode("ascii")
-                request = Request(
-                    f"{base_url}/api/meta",
-                    headers={"Authorization": f"Basic {credentials}"},
-                )
-                with urlopen(request, timeout=5) as response:
+                with urlopen(f"{base_url}/api/meta", timeout=5) as response:
                     payload = json.load(response)
+                with self.assertRaises(HTTPError) as raised:
+                    urlopen(f"{base_url}/api/market", timeout=5)
+                raised.exception.close()
             finally:
                 server.shutdown()
                 server.server_close()
                 thread.join(timeout=5)
             self.assertEqual(raised.exception.code, 401)
-            self.assertIn("Basic", raised.exception.headers["WWW-Authenticate"])
             self.assertIn("app_version", payload)
 
 
@@ -117,7 +91,11 @@ class ViewerPaginationTests(unittest.TestCase):
             handler = type(
                 "PaginatedViewerHandler",
                 (ViewerHandler,),
-                {"database": database, "cache_dir": cache},
+                {
+                    "database": database,
+                    "cache_dir": cache,
+                    "_is_authenticated": lambda self: True,
+                },
             )
             server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
             thread = threading.Thread(target=server.serve_forever, daemon=True)

@@ -1,6 +1,6 @@
 import unittest
 
-from auto_parser.viewer_query import build_filters, integer
+from auto_parser.viewer_query import build_filters, integer, normalize_text
 
 
 class ViewerQueryTests(unittest.TestCase):
@@ -50,6 +50,13 @@ class ViewerQueryTests(unittest.TestCase):
     def test_integer_clamps_to_minimum(self) -> None:
         self.assertEqual(integer("-10", minimum=1), 1)
         self.assertIsNone(integer("not-a-number"))
+
+    def test_normalizes_legacy_city_encoding_case_insensitively(self) -> None:
+        legacy_moscow = "Москва".encode("cp1251").decode("latin1")
+        self.assertEqual(normalize_text(legacy_moscow), "москва")
+        where, values = build_filters({"location": ["МОСКВА"]})
+        self.assertIn("NORMALIZE_TEXT(l.location)", where)
+        self.assertEqual(values, ["%москва%"])
 
 
 if __name__ == "__main__":

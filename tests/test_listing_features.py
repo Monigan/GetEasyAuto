@@ -72,7 +72,7 @@ class ListingFeatureTests(unittest.TestCase):
             handler = type(
                 "ListingFeaturesViewerHandler",
                 (ViewerHandler,),
-                {"database": database, "cache_dir": cache},
+                {"database": database, "cache_dir": cache, "_is_authenticated": lambda self: True},
             )
             server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
             thread = threading.Thread(target=server.serve_forever, daemon=True)

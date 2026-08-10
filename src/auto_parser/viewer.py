@@ -10,7 +10,6 @@ import sqlite3
 import statistics
 import time
 import secrets
-import sqlite3
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
@@ -54,12 +53,9 @@ from auto_parser.viewer_query import (
 from auto_parser.viewer_security import (
     SESSION_COOKIE,
     authenticate_user,
-    authorize_request,
     create_session,
     create_user,
-    resolve_password,
     session_user,
-    user_count,
     validate_remote_access,
 )
 
@@ -284,7 +280,6 @@ class ViewerHandler(
 ):
     database: Path
     cache_dir: Path
-    viewer_password: str | None = None
     session_secret: bytes = secrets.token_bytes(32)
 
     def handle(self) -> None:
@@ -339,26 +334,44 @@ class ViewerHandler(
         if parsed.path in {"/auth", "/auth.html", "/auth.css", "/auth.js"}:
             self._static("/auth.html" if parsed.path == "/auth" else parsed.path)
             return
+        public_assets = {
+            "/", "/index.html", "/styles.css", "/app.js", "/ui.js",
+            "/garage.js", "/notifications.js",
+        }
+        if parsed.path in public_assets:
+            self._static(parsed.path)
+            return
+        if parsed.path.startswith("/media/"):
+            self._media(parsed.path)
+            return
+        if parsed.path == "/api/meta":
+            self._meta()
+            return
+        if parsed.path in {"/api/listings", "/api/stats"}:
+            query = parse_qs(parsed.query)
+            if not self._is_authenticated():
+                query.pop("profile_id", None)
+                query.pop("favorite", None)
+                query["visibility"] = ["visible"]
+            if parsed.path == "/api/listings":
+                self._listings(query)
+            else:
+                self._stats(query)
+            return
         if not self._request_authorized():
             return
         if self._garage_get_route(parsed.path):
             return
         if self._notification_get_route(parsed.path):
             return
-        if parsed.path == "/api/listings":
-            self._listings(parse_qs(parsed.query))
-        elif parsed.path == "/api/sold":
+        if parsed.path == "/api/sold":
             self._sold(parse_qs(parsed.query))
         elif parsed.path == "/api/refresh-activity":
             self._refresh_activity()
-        elif parsed.path == "/api/stats":
-            self._stats(parse_qs(parsed.query))
         elif parsed.path == "/api/market":
             self._market(parse_qs(parsed.query))
         elif parsed.path == "/api/export-analysis":
             self._export_analysis(parse_qs(parsed.query))
-        elif parsed.path == "/api/meta":
-            self._meta()
         elif parsed.path == "/api/search-profiles":
             self._search_profiles()
         elif parsed.path == "/api/vehicle-analyses":
@@ -371,8 +384,6 @@ class ViewerHandler(
             self._parts(parse_qs(parsed.query))
         elif parsed.path == "/api/spare-parts":
             self._spare_parts_catalog(parse_qs(parsed.query))
-        elif parsed.path.startswith("/media/"):
-            self._media(parsed.path)
         else:
             self._static(parsed.path)
 
@@ -499,11 +510,7 @@ class ViewerHandler(
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def _request_authorized(self) -> bool:
-        if session_user(self.headers.get("Cookie"), self.session_secret):
-            return True
-        if self.viewer_password:
-            return authorize_request(self, self.viewer_password)
-        if user_count(self.database) == 0:
+        if self._is_authenticated():
             return True
         if urlparse(self.path).path.startswith("/api/"):
             self._json({"error": "Требуется авторизация"}, HTTPStatus.UNAUTHORIZED)
@@ -514,13 +521,16 @@ class ViewerHandler(
             self.end_headers()
         return False
 
+    def _is_authenticated(self) -> bool:
+        return session_user(self.headers.get("Cookie"), self.session_secret) is not None
+
     def _auth_status(self) -> None:
         user = session_user(self.headers.get("Cookie"), self.session_secret)
         self._json(
             {
                 "authenticated": user is not None,
                 "user": user,
-                "auth_required": bool(self.viewer_password) or user_count(self.database) > 0,
+                "auth_required": True,
             }
         )
 
@@ -560,8 +570,6 @@ class ViewerHandler(
         email = str(payload.get("email", "")).strip()
         password = str(payload.get("password", ""))
         user = authenticate_user(self.database, email, password)
-        if user is None and self.viewer_password and secrets.compare_digest(password, self.viewer_password):
-            user = {"id": 0, "name": "Администратор", "email": email or "admin@autoscope.local"}
         if user is None:
             self._json({"error": "Неверная почта или пароль"}, HTTPStatus.UNAUTHORIZED)
             return
@@ -651,6 +659,7 @@ class ViewerHandler(
                 [*values, page_size, (page - 1) * page_size],
             ).fetchall()
         items = []
+        authenticated = self._is_authenticated()
         with ListingRepository(self.database) as repository:
             analytics_cache: dict[
                 tuple[str, str, int | None], dict[str, Any] | None
@@ -658,11 +667,17 @@ class ViewerHandler(
             for row in rows:
                 item = dict(row)
                 try:
-                    item["attributes"] = json.loads(
+                    raw_attributes = json.loads(
                         item.pop("attributes_json") or "{}"
                     )
-                except (json.JSONDecodeError, TypeError):
+                    item["attributes"] = {
+                        _repair_legacy_text(key): _repair_legacy_text(value)
+                        for key, value in raw_attributes.items()
+                    }
+                except (AttributeError, json.JSONDecodeError, TypeError):
                     item["attributes"] = {}
+                for field in ("title", "description", "brand", "model", "location"):
+                    item[field] = _repair_legacy_text(item.get(field)) or None
                 year = _listing_year(item, item["attributes"])
                 item["year"] = year
                 item["published_at_inferred"] = not bool(item["published_at"])
@@ -712,10 +727,13 @@ class ViewerHandler(
                         item["external_id"],
                     )
                 )
-                item["user_data"] = repository.listing_user_data(
-                    item["source"],
-                    item["external_id"],
+                item["user_data"] = (
+                    repository.listing_user_data(item["source"], item["external_id"])
+                    if authenticated
+                    else {"favorite": False, "note": ""}
                 )
+                if not authenticated:
+                    item["garage_id"] = None
                 analytics_key = (
                     str(item.get("brand") or "").casefold(),
                     str(item.get("model") or "").casefold(),
@@ -1970,8 +1988,8 @@ class ViewerHandler(
 
     def _meta(self) -> None:
         with _open_database(self.database) as connection:
-            locations = [
-                row[0]
+            locations = sorted({
+                _repair_legacy_text(row[0])
                 for row in connection.execute(
                     """
                     SELECT DISTINCT location FROM listings
@@ -1979,9 +1997,10 @@ class ViewerHandler(
                     ORDER BY location
                     """
                 )
-            ]
-            brands = [
-                row[0]
+                if _repair_legacy_text(row[0])
+            }, key=str.casefold)
+            brands = sorted({
+                _repair_legacy_text(row[0])
                 for row in connection.execute(
                     """
                     SELECT DISTINCT brand FROM listings
@@ -1989,7 +2008,8 @@ class ViewerHandler(
                     ORDER BY brand COLLATE NOCASE
                     """
                 )
-            ]
+                if _repair_legacy_text(row[0])
+            }, key=str.casefold)
             model_rows = connection.execute(
                 """
                 SELECT DISTINCT brand, model FROM listings
@@ -2624,13 +2644,10 @@ def serve(
     host: str = "127.0.0.1",
     port: int = 8080,
     allow_remote: bool = False,
-    password: str | None = None,
 ) -> None:
-    password = resolve_password(password)
     validate_remote_access(
         host,
         allow_remote=allow_remote,
-        password=password,
     )
     if host not in {"127.0.0.1", "localhost", "::1"} and not allow_remote:
         raise ValueError(
@@ -2646,7 +2663,6 @@ def serve(
         {
             "database": database.resolve(),
             "cache_dir": cache_dir.resolve(),
-            "viewer_password": password,
         },
     )
     server = ThreadingHTTPServer((host, port), handler)
@@ -2671,7 +2687,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--allow-remote", action="store_true")
-    parser.add_argument("--password", help="Пароль веб-панели")
     parser.add_argument(
         "--scheduler",
         dest="scheduler",
@@ -2702,7 +2717,6 @@ def main(argv: list[str] | None = None) -> int:
             host=args.host,
             port=args.port,
             allow_remote=args.allow_remote,
-            password=args.password,
         )
     finally:
         if scheduler:

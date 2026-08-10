@@ -133,13 +133,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Явно разрешить веб-панели слушать нелокальный адрес",
     )
     parser.add_argument(
-        "--viewer-password",
-        help=(
-            "Пароль веб-панели; для удалённого доступа также можно задать "
-            "AUTOSCOPE_VIEWER_PASSWORD"
-        ),
-    )
-    parser.add_argument(
         "--scheduler",
         dest="scheduler",
         action="store_true",
@@ -206,7 +199,6 @@ def main(argv: list[str] | None = None) -> int:
                 host=args.viewer_host,
                 port=args.viewer_port,
                 allow_remote=args.allow_remote_viewer,
-                password=args.viewer_password,
             )
         except (OSError, ValueError) as error:
             print(f"Ошибка панели: {error}", file=sys.stderr)

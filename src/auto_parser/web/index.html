@@ -17,19 +17,19 @@
         <button class="nav-button active" type="button" data-view="catalog" aria-current="page">
           Объявления
         </button>
-        <button class="nav-button" type="button" data-view="analytics">
+        <button class="nav-button" type="button" data-view="analytics" data-auth-required>
           Аналитика рынка
         </button>
-        <button class="nav-button" type="button" data-view="knowledge">
+        <button class="nav-button" type="button" data-view="knowledge" data-auth-required>
           База данных
         </button>
-        <button class="nav-button" type="button" data-view="spare-parts">
+        <button class="nav-button" type="button" data-view="spare-parts" data-auth-required>
           Автозапчасти
         </button>
-        <button class="nav-button" type="button" data-view="sold">
+        <button class="nav-button" type="button" data-view="sold" data-auth-required>
           Проданные
         </button>
-        <button class="nav-button" type="button" data-view="garage">
+        <button class="nav-button" type="button" data-view="garage" data-auth-required>
           Гараж
         </button>
       </nav>
@@ -37,7 +37,7 @@
         <a class="account-link" href="/auth.html" aria-label="Войти в аккаунт">Войти</a>
         <button
           id="refresh-activity-open"
-          class="topbar-note"
+          class="topbar-note" data-auth-required
           type="button"
           aria-controls="refresh-activity"
           aria-expanded="false"
@@ -45,11 +45,11 @@
           <span class="status-dot"></span>
           База обновляется
         </button>
-        <button id="notifications-open" class="notification-button" type="button">
+        <button id="notifications-open" class="notification-button" type="button" data-auth-required>
           Уведомления
           <span id="notifications-badge" class="notification-badge" hidden>0</span>
         </button>
-        <button id="profiles-open" class="primary-button" type="button">
+        <button id="profiles-open" class="primary-button" type="button" data-auth-required>
           Автопоиск
         </button>
       </div>
@@ -137,7 +137,7 @@
               <option value="power_desc">Больше лошадиных сил</option>
             </select>
           </label>
-          <label>
+          <label data-auth-required>
             <span>Показывать</span>
             <select id="visibility">
               <option value="visible">Только видимые</option>
@@ -146,7 +146,7 @@
               <option value="all">Все объявления</option>
             </select>
           </label>
-          <label>
+          <label data-auth-required>
             <span>Подборка</span>
             <select id="favorite">
               <option value="">Все объявления</option>
@@ -632,10 +632,10 @@
           <div class="car-footer">
             <span class="car-seen"></span>
             <div class="car-actions">
-              <button class="car-favorite card-icon-action" type="button"></button>
-              <button class="car-compare card-icon-action" type="button"></button>
-              <button class="car-garage card-secondary-action" type="button"></button>
-              <button class="car-hide card-secondary-action" type="button"></button>
+              <button class="car-favorite card-icon-action" type="button" data-auth-required></button>
+              <button class="car-compare card-icon-action" type="button" data-auth-required></button>
+              <button class="car-garage card-secondary-action" type="button" data-auth-required></button>
+              <button class="car-hide card-secondary-action" type="button" data-auth-required></button>
               <a class="car-link" target="_blank" rel="noopener noreferrer">Открыть ↗</a>
             </div>
           </div>
@@ -672,8 +672,8 @@
               <div id="detail-price" class="detail-price"></div>
             </div>
             <div class="detail-primary-actions">
-              <button id="detail-favorite" class="ghost-button" type="button"></button>
-              <button id="detail-compare" class="ghost-button" type="button"></button>
+              <button id="detail-favorite" class="ghost-button" type="button" data-auth-required></button>
+              <button id="detail-compare" class="ghost-button" type="button" data-auth-required></button>
             </div>
             <div class="detail-summary">
               <div><span>Пробег</span><strong id="detail-mileage"></strong></div>
