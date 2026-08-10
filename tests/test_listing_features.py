@@ -123,7 +123,17 @@ class ListingFeatureTests(unittest.TestCase):
                             "analysis": {
                                 "model_analysis": {
                                     "summary": "Общий анализ модели",
-                                    "weak_points": [],
+                                    "weak_points": [
+                                        {
+                                            "id": "cooling_pump",
+                                            "system": "Охлаждение",
+                                            "issue": "Износ помпы",
+                                            "priority": "high",
+                                            "parts_cost_min": 18000,
+                                            "labor_cost_min": 6000,
+                                            "repair_parts": [{"name": "Водяная помпа"}],
+                                        }
+                                    ],
                                 }
                             },
                         }
@@ -133,6 +143,27 @@ class ListingFeatureTests(unittest.TestCase):
                 )
                 with urlopen(analysis_request, timeout=5) as response:
                     saved_analysis = json.load(response)
+                garage_request = Request(
+                    f"{base_url}/api/garage",
+                    data=json.dumps(
+                        {"listing_source": "avito", "listing_external_id": "one"}
+                    ).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urlopen(garage_request, timeout=5) as response:
+                    garage_id = json.load(response)["id"]
+                seed_request = Request(
+                    f"{base_url}/api/garage/{garage_id}/parts/seed",
+                    data=b"",
+                    method="POST",
+                )
+                with urlopen(seed_request, timeout=5) as response:
+                    garage_seed = json.load(response)
+                with urlopen(
+                    f"{base_url}/api/garage/{garage_id}", timeout=5
+                ) as response:
+                    garage_detail = json.load(response)
             finally:
                 server.shutdown()
                 server.server_close()
@@ -154,6 +185,14 @@ class ListingFeatureTests(unittest.TestCase):
         self.assertEqual(len(comparison["items"]), 2)
         self.assertEqual(saved_analysis["analysis_trim_name"], "")
         self.assertEqual(saved_analysis["vehicle_analysis"]["match_kind"], "model")
+        self.assertEqual(
+            garage_detail["vehicle_analysis"]["data"]["summary"],
+            "Общий анализ модели",
+        )
+        self.assertEqual(garage_seed["analysis_created"], 1)
+        self.assertTrue(
+            any(part["name"] == "Водяная помпа" for part in garage_detail["parts"])
+        )
 
 
 if __name__ == "__main__":

@@ -138,7 +138,7 @@ export function createGarageController() {
       const title = document.createElement("strong");
       title.textContent = part.name;
       const meta = document.createElement("small");
-      meta.textContent = `${part.category} · ${part.replacement_term}${part.estimated ? " · оценка" : ""}`;
+      meta.textContent = `${part.category} · ${part.replacement_term} · ${part.estimated ? "ориентировочная цена" : "цена из предложения"}`;
       name.append(title, meta);
       const total = document.createElement("b");
       total.textContent = formatMoney(
@@ -180,6 +180,97 @@ export function createGarageController() {
     }
   }
 
+  function renderAnalysis(payload) {
+    const root = document.getElementById("garage-analysis");
+    const pointsRoot = document.getElementById("garage-analysis-points");
+    const offersRoot = document.getElementById("garage-live-offers");
+    const status = document.getElementById("garage-analysis-status");
+    const summary = document.getElementById("garage-analysis-summary");
+    const analysisRecord = payload.vehicle_analysis;
+    const analysis = analysisRecord?.data || {};
+    const assessment = payload.listing_assessment?.data || {};
+    const excluded = new Set(assessment.excluded_weak_point_ids || []);
+    const relevant = new Set(assessment.relevant_weak_point_ids || []);
+    const points = (analysis.weak_points || []).filter((point) => {
+      if (point.id && excluded.has(point.id)) return false;
+      return !relevant.size || !point.id || relevant.has(point.id);
+    });
+    root.classList.toggle("is-empty", !analysisRecord);
+    status.textContent = analysisRecord
+      ? `Проведён ${String(analysisRecord.updated_at || "").slice(0, 10)}${analysisRecord.trim_name ? ` · ${analysisRecord.trim_name}` : ""}`
+      : "Анализ ещё не проводился";
+    summary.textContent = analysis.summary || "Проведите анализ ChatGPT в карточке объявления — рекомендации автоматически появятся здесь.";
+    pointsRoot.replaceChildren();
+    const matches = new Map(
+      (payload.spare_parts?.matches || []).map((match) => [match.weak_point_id, match]),
+    );
+    for (const point of points) {
+      const card = document.createElement("article");
+      card.className = `garage-analysis-point priority-${point.priority || "medium"}`;
+      const header = document.createElement("header");
+      const title = document.createElement("strong");
+      title.textContent = [point.system, point.issue].filter(Boolean).join(" — ") || "Рекомендация";
+      const priority = document.createElement("span");
+      priority.textContent = point.priority === "high" ? "Срочно" : point.priority === "low" ? "Наблюдать" : "Запланировать";
+      header.append(title, priority);
+      const detail = document.createElement("p");
+      detail.textContent = [point.symptoms && `Симптомы: ${point.symptoms}`, point.check && `Проверка: ${point.check}`].filter(Boolean).join(" · ");
+      const replacements = document.createElement("div");
+      replacements.className = "garage-replacements";
+      const repairParts = point.repair_parts || [];
+      replacements.textContent = repairParts.length
+        ? `Заменить: ${repairParts.map((part) => part.name).filter(Boolean).join(", ")}`
+        : "Список деталей для замены не указан";
+      const costs = document.createElement("small");
+      const match = matches.get(point.id);
+      const livePrice = (match?.offers || [])
+        .filter((offer) => offer.price != null)
+        .reduce((total, offer) => total + offer.price, 0);
+      costs.textContent = livePrice
+        ? `Найденные предложения: ${formatMoney(livePrice)} · работа от ${formatMoney(point.labor_cost_min || 0)}`
+        : `Оценка запчастей: ${formatMoney(point.parts_cost_min)}–${formatMoney(point.parts_cost_max ?? point.parts_cost_min)} · работа от ${formatMoney(point.labor_cost_min || 0)}`;
+      card.append(header, detail, replacements, costs);
+      pointsRoot.append(card);
+    }
+    offersRoot.replaceChildren();
+    const compatible = payload.spare_parts?.compatible_offers || [];
+    if (compatible.length) {
+      const heading = document.createElement("strong");
+      heading.textContent = `Актуальные предложения (${compatible.length})`;
+      const list = document.createElement("div");
+      for (const offer of compatible.slice(0, 6)) {
+        const link = document.createElement("a");
+        link.href = offer.source_url;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        const name = document.createElement("span");
+        name.textContent = offer.name;
+        const price = document.createElement("b");
+        price.textContent = formatMoney(offer.price);
+        link.append(name, price);
+        list.append(link);
+      }
+      offersRoot.append(heading, list);
+    }
+  }
+
+  function fillEditForm(car) {
+    const form = document.getElementById("garage-edit-form");
+    const values = {
+      name: car.name, brand: car.brand, model: car.model, year: car.year,
+      vin: car.vin, plate_number: car.plate_number, purchase_date: car.purchase_date,
+      purchase_price: car.purchase_price, notes: car.notes,
+      color: car.attributes?.["Цвет"], engine_type: car.attributes?.["Тип двигателя"],
+      engine_volume: car.attributes?.["Объём двигателя"], power: String(car.attributes?.["Мощность"] || "").match(/\d+/)?.[0],
+      transmission: car.attributes?.["Коробка передач"], drive: car.attributes?.["Привод"],
+      body: car.attributes?.["Тип кузова"],
+    };
+    for (const [name, value] of Object.entries(values)) {
+      if (form.elements[name]) form.elements[name].value = value ?? "";
+    }
+    document.querySelector('#garage-mileage-form [name="mileage_km"]').value = car.mileage_km ?? "";
+  }
+
   function renderDetail(payload) {
     const { car, analytics } = payload;
     document.getElementById("garage-detail").hidden = false;
@@ -195,6 +286,17 @@ export function createGarageController() {
     setText("garage-planned", formatMoney(analytics.planned_total));
     setText("garage-ownership", formatMoney(analytics.ownership_total));
     setText("garage-future", formatMoney(analytics.future_total));
+    const photo = document.getElementById("garage-photo");
+    const photoEmpty = document.getElementById("garage-photo-empty");
+    photo.hidden = !car.photo_url;
+    photoEmpty.hidden = Boolean(car.photo_url);
+    if (car.photo_url) {
+      photo.src = car.photo_url;
+      photo.alt = car.name;
+    } else {
+      photo.removeAttribute("src");
+    }
+    fillEditForm(car);
     const attributes = document.getElementById("garage-attributes");
     attributes.replaceChildren();
     for (const [name, value] of Object.entries(car.attributes || {})) {
@@ -210,6 +312,7 @@ export function createGarageController() {
     attributes.hidden = attributes.childElementCount === 0;
     renderEntries(payload.entries);
     renderParts(payload.parts);
+    renderAnalysis(payload);
   }
 
   async function refresh() {
@@ -274,11 +377,78 @@ export function createGarageController() {
       await refresh();
     });
 
-    document.getElementById("garage-parts-seed").addEventListener("click", async () => {
+    document.getElementById("garage-mileage-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
       if (!currentId) return;
-      await request(`/api/garage/${currentId}/parts/seed`, { method: "POST", body: "" });
+      const value = event.currentTarget.elements.mileage_km.value;
+      await request(`/api/garage/${currentId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mileage_km: value }),
+      });
       signature = "";
       await refresh();
+    });
+
+    const editForm = document.getElementById("garage-edit-form");
+    document.getElementById("garage-edit-toggle").addEventListener("click", () => {
+      editForm.hidden = !editForm.hidden;
+      if (!editForm.hidden) editForm.scrollIntoView({ behavior: "smooth", block: "center" });
+    });
+    document.getElementById("garage-edit-close").addEventListener("click", () => {
+      editForm.hidden = true;
+    });
+    editForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      if (!currentId) return;
+      await request(`/api/garage/${currentId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(Object.fromEntries(new FormData(editForm).entries())),
+      });
+      editForm.hidden = true;
+      signature = "";
+      await refresh();
+    });
+
+    document.getElementById("garage-photo-input").addEventListener("change", async (event) => {
+      const file = event.currentTarget.files?.[0];
+      if (!file || !currentId) return;
+      if (file.size > 4 * 1024 * 1024) {
+        alert("Выберите фотографию размером до 4 МБ");
+        event.currentTarget.value = "";
+        return;
+      }
+      const dataUrl = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(new Error("Не удалось прочитать фотографию"));
+        reader.readAsDataURL(file);
+      });
+      await request(`/api/garage/${currentId}/photo`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ data_url: dataUrl }),
+      });
+      event.currentTarget.value = "";
+      signature = "";
+      await refresh();
+    });
+
+    document.getElementById("garage-parts-seed").addEventListener("click", async () => {
+      if (!currentId) return;
+      const button = document.getElementById("garage-parts-seed");
+      const status = document.getElementById("garage-parts-state");
+      button.disabled = true;
+      status.textContent = "Сопоставляем типовой план, анализ ChatGPT и найденные предложения…";
+      try {
+        const result = await request(`/api/garage/${currentId}/parts/seed`, { method: "POST", body: "" });
+        status.textContent = `План обновлён: добавлено ${result.created}, обновлено ${result.updated}. Рекомендаций из анализа: ${result.analysis_created}.`;
+        signature = "";
+        await refresh();
+      } finally {
+        button.disabled = false;
+      }
     });
     document.getElementById("garage-delete").addEventListener("click", async () => {
       if (!currentId || !confirm("Удалить автомобиль и всю его историю?")) return;

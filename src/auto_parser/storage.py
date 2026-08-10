@@ -241,6 +241,7 @@ class ListingRepository:
                 purchase_date TEXT,
                 purchase_price INTEGER,
                 attributes_json TEXT NOT NULL DEFAULT '{}',
+                photo_path TEXT,
                 notes TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -308,6 +309,14 @@ class ListingRepository:
         if "garage_id" not in part_columns:
             self.connection.execute(
                 "ALTER TABLE car_parts ADD COLUMN garage_id INTEGER"
+            )
+        garage_columns = {
+            row["name"]
+            for row in self.connection.execute("PRAGMA table_info(garage_cars)")
+        }
+        if "photo_path" not in garage_columns:
+            self.connection.execute(
+                "ALTER TABLE garage_cars ADD COLUMN photo_path TEXT"
             )
         analysis_schema_row = self.connection.execute(
             "SELECT sql FROM sqlite_master "

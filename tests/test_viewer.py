@@ -683,6 +683,44 @@ class ViewerTests(unittest.TestCase):
                 )
                 with urlopen(create_garage_part_request, timeout=5) as response:
                     created_garage_part = json.load(response)
+                seed_garage_request = Request(
+                    f"{base_url}/api/garage/{garage_id}/parts/seed",
+                    data=b"",
+                    method="POST",
+                )
+                with urlopen(seed_garage_request, timeout=5) as response:
+                    seeded_garage = json.load(response)
+                update_garage_request = Request(
+                    f"{base_url}/api/garage/{garage_id}",
+                    data=json.dumps(
+                        {"mileage_km": 182000, "color": "Белый", "power": 250}
+                    ).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="PATCH",
+                )
+                with urlopen(update_garage_request, timeout=5) as response:
+                    updated_garage = json.load(response)
+                upload_photo_request = Request(
+                    f"{base_url}/api/garage/{garage_id}/photo",
+                    data=json.dumps(
+                        {
+                            "data_url": (
+                                "data:image/png;base64,"
+                                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwC"
+                                "AAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+                            )
+                        }
+                    ).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urlopen(upload_photo_request, timeout=5) as response:
+                    uploaded_photo = json.load(response)
+                with urlopen(
+                    f"{base_url}/api/garage/{garage_id}/photo", timeout=5
+                ) as response:
+                    garage_photo_type = response.headers["Content-Type"]
+                    garage_photo_bytes = response.read()
                 with urlopen(f"{base_url}/api/garage", timeout=5) as response:
                     garage_list = json.load(response)
                 with urlopen(
@@ -933,12 +971,23 @@ class ViewerTests(unittest.TestCase):
                     for item in parts_after_create["items"]
                 )
             )
+            self.assertGreater(
+                seeded_garage["created"] + seeded_garage["updated"], 0
+            )
+            self.assertIn("vehicle_analysis", garage_detail)
+            self.assertIn("spare_parts", garage_detail)
+            self.assertTrue(updated_garage["updated"])
+            self.assertIn("/photo", uploaded_photo["photo_url"])
+            self.assertEqual(garage_photo_type, "image/png")
+            self.assertTrue(garage_photo_bytes.startswith(b"\x89PNG"))
+            self.assertEqual(garage_detail["car"]["mileage_km"], 182000)
+            self.assertEqual(garage_detail["car"]["attributes"]["Цвет"], "Белый")
             self.assertGreater(created_garage["id"], 0)
             self.assertGreater(created_entry["id"], 0)
             self.assertGreater(created_garage_part["id"], 0)
             self.assertEqual(garage_list["items"][0]["name"], "Volvo XC90")
             self.assertEqual(garage_detail["car"]["vin"], "YV1TESTGARAGE0001")
-            self.assertEqual(garage_detail["car"]["mileage_km"], 181000)
+            self.assertEqual(garage_detail["car"]["mileage_km"], 182000)
             self.assertEqual(garage_detail["analytics"]["spent_total"], 12500)
             self.assertEqual(garage_detail["analytics"]["service_total"], 12500)
             self.assertGreaterEqual(garage_detail["analytics"]["planned_total"], 10500)
