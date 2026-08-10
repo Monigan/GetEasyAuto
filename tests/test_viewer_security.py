@@ -10,10 +10,23 @@ from urllib.request import Request, urlopen
 from auto_parser.models import Listing, utc_now_iso
 from auto_parser.storage import ListingRepository
 from auto_parser.viewer import ViewerHandler
-from auto_parser.viewer_security import validate_remote_access
+from auto_parser.viewer_security import (
+    create_session,
+    session_user,
+    validate_remote_access,
+)
 
 
 class ViewerSecurityTests(unittest.TestCase):
+    def test_web_session_round_trip(self) -> None:
+        user = {"id": 7, "name": "Тест", "email": "test@example.com"}
+        secret = b"session-secret"
+
+        token = create_session(user, secret)
+        restored = session_user(f"autoscope_session={token}", secret)
+
+        self.assertEqual(restored, user)
+
     def test_remote_access_requires_explicit_flag(self) -> None:
         with self.assertRaisesRegex(ValueError, "allow-remote-viewer"):
             validate_remote_access(
