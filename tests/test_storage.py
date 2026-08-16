@@ -117,6 +117,47 @@ class ListingRepositoryTests(unittest.TestCase):
         self.assertIsNone(relisted.sold_at)
         self.assertEqual([row["price"] for row in history], [500_000, 490_000, 500_000])
 
+    def test_unpublished_listing_keeps_404_reason_and_can_be_relisted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "test.db"
+            listing = Listing(
+                source="avito",
+                external_id="removed-car",
+                url="https://www.avito.ru/item_removed",
+                title="BMW 5 серия",
+                price=500_000,
+                collected_at="2026-07-29T12:00:00+00:00",
+            )
+            with ListingRepository(database) as repository:
+                repository.upsert_many([listing])
+                repository.mark_unpublished(
+                    "avito",
+                    "removed-car",
+                    "2026-07-29T18:00:00+00:00",
+                    http_status=404,
+                )
+                removed = repository.get_listing("avito", "removed-car")
+                due = repository.list_for_validation(
+                    due_before="2026-07-30T18:00:00+00:00"
+                )
+
+                listing.collected_at = "2026-07-30T19:00:00+00:00"
+                repository.upsert_many([listing])
+                relisted = repository.get_listing("avito", "removed-car")
+
+        self.assertEqual(removed.status, "removed")
+        self.assertEqual(
+            removed.unpublished_at,
+            "2026-07-29T18:00:00+00:00",
+        )
+        self.assertEqual(removed.unpublished_http_status, 404)
+        self.assertIsNone(removed.sold_price)
+        self.assertIsNone(removed.sold_at)
+        self.assertNotIn("removed-car", [item.external_id for item in due])
+        self.assertEqual(relisted.status, "active")
+        self.assertIsNone(relisted.unpublished_at)
+        self.assertIsNone(relisted.unpublished_http_status)
+
     def test_detail_refresh_prioritizes_incomplete_due_listing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "test.db"

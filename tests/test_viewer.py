@@ -337,6 +337,24 @@ class ViewerTests(unittest.TestCase):
                         )
                     ]
                 )
+                repository.upsert_many(
+                    [
+                        Listing(
+                            source="avito",
+                            external_id="removed",
+                            url="https://www.avito.ru/item_removed",
+                            title="BMW 530i",
+                            price=620_000,
+                            brand="BMW",
+                        )
+                    ]
+                )
+                repository.mark_unpublished(
+                    "avito",
+                    "removed",
+                    "2026-07-29T20:00:00+00:00",
+                    http_status=404,
+                )
                 repository.mark_sold(
                     "drom",
                     "sold",
@@ -372,6 +390,8 @@ class ViewerTests(unittest.TestCase):
                     catalog = json.load(response)
                 with urlopen(f"{base_url}/api/market?source=avito", timeout=5) as response:
                     market = json.load(response)
+                with urlopen(f"{base_url}/api/stats?source=avito", timeout=5) as response:
+                    stats = json.load(response)
                 with urlopen(f"{base_url}/api/sold?source=drom", timeout=5) as response:
                     sold = json.load(response)
                 with urlopen(
@@ -394,6 +414,12 @@ class ViewerTests(unittest.TestCase):
 
         self.assertEqual(active["total"], 1)
         self.assertEqual(catalog["total"], 1)
+        self.assertEqual(stats["count"], 2)
+        self.assertEqual(stats["active_count"], 1)
+        self.assertEqual(stats["removed_count"], 1)
+        self.assertEqual(market["summary"]["count"], 2)
+        self.assertEqual(market["summary"]["active_count"], 1)
+        self.assertEqual(market["summary"]["removed_count"], 1)
         self.assertEqual(market["price_changes"][0]["delta"], -50_000)
         self.assertEqual(sold["summary"]["count"], 1)
         self.assertEqual(sold["items"][0]["sold_price"], 500_000)

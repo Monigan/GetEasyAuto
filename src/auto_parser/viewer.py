@@ -29,7 +29,13 @@ from auto_parser.images import (
     deduplicate_image_urls,
 )
 from auto_parser.garage_api import GarageApiMixin
-from auto_parser.models import utc_now_iso
+from auto_parser.models import (
+    LISTING_ANALYTICS_STATUSES,
+    LISTING_STATUS_ACTIVE,
+    LISTING_STATUS_REMOVED,
+    LISTING_STATUS_SOLD,
+    utc_now_iso,
+)
 from auto_parser.notification_api import NotificationApiMixin
 from auto_parser.parts_api import PartsApiMixin
 from auto_parser.request_governor import RequestGovernor
@@ -219,18 +225,25 @@ def _model_market_analytics(
     rows = generation_rows
     if not rows:
         return None
-    active_rows = [row for row in rows if row["status"] == "active"]
-    sold_rows = [row for row in rows if row["status"] == "sold"]
-    active_prices = [
-        row["price"] for row in active_rows if row["price"] is not None
+    active_rows = [
+        row for row in rows if row["status"] == LISTING_STATUS_ACTIVE
     ]
-    all_prices = [row["price"] for row in rows if row["price"] is not None]
+    removed_rows = [
+        row for row in rows if row["status"] == LISTING_STATUS_REMOVED
+    ]
+    sold_rows = [
+        row for row in rows if row["status"] == LISTING_STATUS_SOLD
+    ]
+    market_rows = active_rows + removed_rows
+    market_prices = [
+        row["price"] for row in market_rows if row["price"] is not None
+    ]
     sold_prices = [
         row["sold_price"] if row["sold_price"] is not None else row["price"]
         for row in sold_rows
         if row["sold_price"] is not None or row["price"] is not None
     ]
-    reference_prices = active_prices or all_prices
+    reference_prices = market_prices or sold_prices
     average_price = (
         round(statistics.fmean(reference_prices))
         if reference_prices
@@ -246,6 +259,7 @@ def _model_market_analytics(
         "unknown_year_count": unknown_year_count,
         "listings_count": len(rows),
         "active_count": len(active_rows),
+        "removed_count": len(removed_rows),
         "sold_count": len(sold_rows),
         "has_sales": bool(sold_rows),
         "average_price": average_price,
@@ -376,6 +390,8 @@ class ViewerHandler(
             self._search_profiles()
         elif parsed.path == "/api/vehicle-analyses":
             self._vehicle_analyses(parse_qs(parsed.query))
+        elif parsed.path == "/api/vehicle-analysis/context":
+            self._vehicle_analysis_context(parse_qs(parsed.query))
         elif parsed.path == "/api/comparison":
             self._comparison(parse_qs(parsed.query))
         elif parsed.path == "/api/parts/cars":
@@ -1154,7 +1170,10 @@ class ViewerHandler(
         )
 
     def _stats(self, query: dict[str, list[str]]) -> None:
-        where, values = _filters(query, default_status="active")
+        where, values = _filters(
+            query,
+            default_statuses=LISTING_ANALYTICS_STATUSES,
+        )
         with _open_database(self.database) as connection:
             rows = connection.execute(
                 f"""
@@ -1216,6 +1235,12 @@ class ViewerHandler(
         self._json(
             {
                 "count": len(rows),
+                "active_count": sum(
+                    row["status"] == LISTING_STATUS_ACTIVE for row in rows
+                ),
+                "removed_count": sum(
+                    row["status"] == LISTING_STATUS_REMOVED for row in rows
+                ),
                 "avg_price": round(statistics.fmean(prices)) if prices else None,
                 "median_price": round(statistics.median(prices)) if prices else None,
                 "median_mileage": (
@@ -1243,7 +1268,10 @@ class ViewerHandler(
         )
 
     def _market(self, query: dict[str, list[str]]) -> None:
-        where, values = _filters(query, default_status="active")
+        where, values = _filters(
+            query,
+            default_statuses=LISTING_ANALYTICS_STATUSES,
+        )
         sold_query = dict(query)
         sold_query.pop("status", None)
         sold_where, sold_values = _filters(
@@ -1607,7 +1635,11 @@ class ViewerHandler(
                 "summary": {
                     "count": len(records),
                     "active_count": sum(
-                        record["row"]["status"] == "active"
+                        record["row"]["status"] == LISTING_STATUS_ACTIVE
+                        for record in records
+                    ),
+                    "removed_count": sum(
+                        record["row"]["status"] == LISTING_STATUS_REMOVED
                         for record in records
                     ),
                     "price_count": len(prices),
@@ -1908,6 +1940,10 @@ class ViewerHandler(
                 "last_seen_at": row["last_seen_at"],
                 "views_count": row["views_count"],
                 "status": row["status"],
+                "unpublished_at": row["unpublished_at"],
+                "unpublished_http_status": row[
+                    "unpublished_http_status"
+                ],
                 "hidden": bool(row["hidden"]),
                 "image_count": int(row["image_count"] or 0),
                 "description": description,

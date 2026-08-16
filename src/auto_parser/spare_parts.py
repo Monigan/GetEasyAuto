@@ -42,6 +42,7 @@ _CATEGORY_HINTS = (
     (("бампер", "крыло", "двер", "капот", "кузов", "зеркал"), "Детали кузова"),
     (("двигател", "грм", "порш", "клапан", "головк"), "Двигатель и элементы двигателя"),
 )
+_ANALYSIS_CATALOG_LIMIT = 80
 
 
 def _classes(attributes: dict[str, str | None]) -> set[str]:
@@ -59,6 +60,23 @@ def _price(value: str) -> int | None:
 
 def normalize_vehicle(value: str | None) -> str:
     return re.sub(r"[^a-zа-я0-9]+", "", str(value or "").casefold().replace("ё", "е"))
+
+
+def _positive_integer(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        return None
+    return result if result > 0 else None
+
+
+def _money_amount(value: Any, default: int = 0) -> int:
+    try:
+        return max(0, int(value)) if value not in {None, ""} else default
+    except (TypeError, ValueError):
+        return default
 
 
 def is_drom_verification_page(html: str, final_url: str = "") -> bool:
@@ -97,6 +115,7 @@ class SparePartOffer:
 class DromPartsIndex:
     categories: list[str]
     generations: list[dict[str, int | None]]
+    category_links: list[dict[str, str]]
 
 
 class _DromPartsIndexParser(HTMLParser):
@@ -283,15 +302,48 @@ def build_drom_parts_url(
     return "https://baza.drom.ru" + path + ("?" + urlencode(parameters) if parameters else "")
 
 
+def drom_parts_url_with_filters(
+    url: str,
+    *,
+    fuel: str | None = None,
+    generation: int | None = None,
+    engine_volume: str | int | None = None,
+) -> str:
+    """Preserve a Drom-provided category path and apply vehicle filters."""
+    parsed = urlparse(urljoin("https://baza.drom.ru", url))
+    if parsed.scheme != "https" or parsed.hostname not in {"baza.drom.ru", "www.baza.drom.ru"}:
+        raise ValueError("Категория должна вести на HTTPS-страницу baza.drom.ru")
+    query = parse_qs(parsed.query)
+    for key in ("autoPartsFuel", "autoPartsGeneration", "autoPartsVolume"):
+        query.pop(key, None)
+    fuel_key = _fuel_key(fuel)
+    if fuel_key:
+        query["autoPartsFuel"] = [fuel_key]
+    if generation:
+        query["autoPartsGeneration"] = [str(generation)]
+    volume = _volume_cc(engine_volume)
+    if volume:
+        query["autoPartsVolume"] = [str(volume)]
+    parameters = [
+        (key, value)
+        for key, values in query.items()
+        for value in values
+    ]
+    return parsed._replace(query=urlencode(parameters), fragment="").geturl()
+
+
 def parse_drom_parts_index(html: str) -> DromPartsIndex:
     parser = _DromPartsIndexParser()
     parser.feed(html)
     categories: list[str] = []
+    category_links: list[dict[str, str]] = []
     for href, text in parser.category_links:
-        category, subcategory = _category_from_url(urljoin("https://baza.drom.ru", href))
+        absolute_url = urljoin("https://baza.drom.ru", href)
+        category, subcategory = _category_from_url(absolute_url)
         label = " ".join(filter(None, (category, subcategory))) or text
         if label and label not in categories:
             categories.append(label)
+            category_links.append({"category": label, "url": absolute_url})
     generations: list[dict[str, int | None]] = []
     seen: set[int] = set()
     for href, text in parser.generation_links:
@@ -305,7 +357,11 @@ def parse_drom_parts_index(html: str) -> DromPartsIndex:
             "year_from": int(years.group(1)) if years else None,
             "year_to": int(years.group(2)) if years else None,
         })
-    return DromPartsIndex(categories=categories, generations=generations)
+    return DromPartsIndex(
+        categories=categories,
+        generations=generations,
+        category_links=category_links,
+    )
 
 
 def generation_for_year(index: DromPartsIndex, year: int | None) -> int | None:
@@ -343,23 +399,96 @@ def _category_from_url(page_url: str) -> tuple[str | None, str | None]:
 
 
 def nested_categories_for_analysis(analysis: dict[str, Any] | None) -> list[str]:
+    """Return precise marketplace tags, never guessed parent categories."""
     result: list[str] = []
-    for point in (analysis or {}).get("weak_points") or []:
-        parts = point.get("replacement_parts") or point.get("parts") or []
-        if isinstance(parts, str):
-            parts = [parts]
-        for part in parts:
-            name = " ".join(str(part).split())
-            normalized = name.casefold().replace("ё", "е")
-            main = next(
-                (category for hints, category in _CATEGORY_HINTS if any(hint in normalized for hint in hints)),
-                None,
-            )
-            if main:
-                value = f"{main} {name}"
-                if value not in result:
+    normalized_analysis = normalize_vehicle_analysis_parts(analysis or {})
+    for point in normalized_analysis.get("weak_points") or []:
+        for part in point.get("repair_parts") or []:
+            marketplace_tags = part.get("marketplace_tags") or {}
+            tags = marketplace_tags.get("drom") or [part.get("name")]
+            if isinstance(tags, str):
+                tags = [tags]
+            for tag in tags:
+                value = " ".join(str(tag or "").split())
+                if value and value not in result:
                     result.append(value)
     return result
+
+
+def analysis_parts_catalog(
+    offers: list[dict[str, Any]],
+    *,
+    limit: int = _ANALYSIS_CATALOG_LIMIT,
+    compatibility_scope: str = "vehicle_filters",
+) -> dict[str, Any]:
+    """Build a compact, diverse catalog snapshot suitable for an LLM prompt."""
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    category_counts: dict[str, int] = {}
+    priced_count = 0
+    for offer in offers:
+        if offer.get("price") is not None:
+            priced_count += 1
+        key = (
+            str(offer.get("category") or "Без категории"),
+            str(offer.get("subcategory") or ""),
+        )
+        groups.setdefault(key, []).append(offer)
+        category_counts[key[0]] = category_counts.get(key[0], 0) + 1
+
+    selected: list[dict[str, Any]] = []
+    active_groups = [list(group) for group in groups.values()]
+    while active_groups and len(selected) < max(1, limit):
+        remaining_groups: list[list[dict[str, Any]]] = []
+        for group in active_groups:
+            if len(selected) >= max(1, limit):
+                break
+            selected.append(group.pop(0))
+            if group:
+                remaining_groups.append(group)
+        active_groups = remaining_groups
+
+    items = []
+    for offer in selected:
+        description = " ".join(str(offer.get("description") or "").split())
+        items.append({
+            "catalog_offer_id": offer.get("id"),
+            "name": offer.get("name"),
+            "category": offer.get("category"),
+            "subcategory": offer.get("subcategory"),
+            "price_rub": offer.get("price"),
+            "description": description[:180] or None,
+        })
+    return {
+        "total_offers": len(offers),
+        "included_offers": len(items),
+        "priced_offers": priced_count,
+        "price_min": min(
+            (int(offer["price"]) for offer in offers if offer.get("price") is not None),
+            default=None,
+        ),
+        "price_max": max(
+            (int(offer["price"]) for offer in offers if offer.get("price") is not None),
+            default=None,
+        ),
+        "category_counts": [
+            {"category": category, "count": count}
+            for category, count in sorted(
+                category_counts.items(),
+                key=lambda entry: (-entry[1], entry[0].casefold()),
+            )
+        ],
+        "last_observed_at": max(
+            (str(offer.get("observed_at")) for offer in offers if offer.get("observed_at")),
+            default=None,
+        ),
+        "truncated": len(items) < len(offers),
+        "compatibility_scope": compatibility_scope,
+        "selection_policy": (
+            "Разнообразная выборка по категориям и подкатегориям; "
+            "это только уже импортированные совместимые предложения."
+        ),
+        "items": items,
+    }
 
 
 class _DromPartsParser(HTMLParser):
@@ -542,13 +671,47 @@ _PART_LINK_RULES: tuple[tuple[tuple[str, ...], dict[str, Any]], ...] = (
     (("радиатор",), {
         "part_type": "radiator",
         "search_terms": ["радиатор охлаждения", "радиатор двигателя", "радиатор"],
-        "exclude_terms": ["радиатор печки", "радиатор кондиционера"],
+        "exclude_terms": [
+            "радиатор печки", "радиатор отопителя", "радиатор салона",
+            "радиатор кондиционера", "вентилятор радиатора", "диффузор радиатора",
+            "масляный радиатор", "интеркулер",
+        ],
+    }),
+    (("масляный фильтр", "маслянный фильтр", "фильтр масла"), {
+        "part_type": "oil_filter",
+        "search_terms": ["масляный фильтр", "фильтр масляный", "фильтр масла"],
+        "exclude_terms": [
+            "корпус масляного фильтра", "прокладка корпуса масляного фильтра",
+            "крышка масляного фильтра", "масляный радиатор",
+        ],
     }),
 )
 
 
+_SYSTEM_TAG_ALIASES: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("охлажд",), "система охлаждения"),
+    (("смаз", "масл"), "система смазки"),
+    (("тормоз",), "тормозная система"),
+    (("сцеплен", "короб", "трансмисс"), "трансмиссия"),
+    (("подвес", "ходов"), "ходовая часть"),
+    (("топлив",), "топливная система"),
+    (("электр", "зажиган"), "электрика"),
+    (("кузов",), "кузов"),
+)
+
+
+def _system_tag(point: dict[str, Any]) -> str:
+    raw = " ".join(filter(None, (point.get("system"), point.get("fault_type"))))
+    normalized = raw.casefold().replace("ё", "е")
+    return next(
+        (tag for hints, tag in _SYSTEM_TAG_ALIASES if any(hint in normalized for hint in hints)),
+        " ".join(str(point.get("system") or point.get("fault_type") or "прочее").casefold().split()),
+    )
+
+
 def _repair_part_from_name(name: str) -> dict[str, Any]:
     cleaned = " ".join(str(name).split())
+    cleaned = re.sub(r"\bмаслянн(ый|ого|ому|ым|ом)\b", r"маслян\1", cleaned, flags=re.I)
     normalized = cleaned.casefold().replace("ё", "е")
     result: dict[str, Any] = {
         "name": cleaned,
@@ -580,9 +743,19 @@ def normalize_vehicle_analysis_parts(analysis: dict[str, Any]) -> dict[str, Any]
                 part = _repair_part_from_name(raw_part)
             elif isinstance(raw_part, dict):
                 part = _repair_part_from_name(str(raw_part.get("name") or ""))
-                for key in ("part_type", "category", "search_terms", "exclude_terms"):
+                for key in (
+                    "part_type", "category", "search_terms", "exclude_terms",
+                    "system_tag", "part_tag", "marketplace_tags",
+                    "catalog_offer_ids", "catalog_match_status",
+                ):
                     if raw_part.get(key) is not None and raw_part.get(key) != "":
-                        part[key] = deepcopy(raw_part[key])
+                        if key == "exclude_terms":
+                            supplied = raw_part[key]
+                            if isinstance(supplied, str):
+                                supplied = [supplied]
+                            part[key] = [*(part.get(key) or []), *deepcopy(supplied)]
+                        else:
+                            part[key] = deepcopy(raw_part[key])
             else:
                 continue
             if not part["name"]:
@@ -594,6 +767,31 @@ def normalize_vehicle_analysis_parts(analysis: dict[str, Any]) -> dict[str, Any]
                 part[key] = list(dict.fromkeys(
                     " ".join(str(value).split()) for value in values if str(value).strip()
                 ))
+            part["system_tag"] = " ".join(
+                str(part.get("system_tag") or _system_tag(point)).casefold().split()
+            )
+            part["part_tag"] = " ".join(
+                str(part.get("part_tag") or part.get("part_type") or "other").casefold().split()
+            )
+            marketplace_tags = part.get("marketplace_tags") or {}
+            if not isinstance(marketplace_tags, dict):
+                marketplace_tags = {}
+            drom_tags = marketplace_tags.get("drom") or [part["name"]]
+            if isinstance(drom_tags, str):
+                drom_tags = [drom_tags]
+            marketplace_tags["drom"] = list(dict.fromkeys(
+                " ".join(str(value).split())
+                for value in drom_tags if str(value).strip()
+            ))
+            part["marketplace_tags"] = marketplace_tags
+            raw_offer_ids = part.get("catalog_offer_ids") or []
+            if not isinstance(raw_offer_ids, list):
+                raw_offer_ids = [raw_offer_ids]
+            part["catalog_offer_ids"] = list(dict.fromkeys(
+                offer_id
+                for value in raw_offer_ids
+                if (offer_id := _positive_integer(value)) is not None
+            ))
             repair_parts.append(part)
         point["repair_parts"] = repair_parts
         point["replacement_parts"] = [part["name"] for part in repair_parts]
@@ -603,6 +801,47 @@ def normalize_vehicle_analysis_parts(analysis: dict[str, Any]) -> dict[str, Any]
             "matching_policy": "part_name_required",
         }
     return normalized_analysis
+
+
+def normalize_listing_assessment(assessment: dict[str, Any]) -> dict[str, Any]:
+    """Keep one authoritative status per weak point and derive legacy ID lists."""
+    normalized = deepcopy(assessment)
+    raw_statuses = normalized.get("weak_point_statuses")
+    if not isinstance(raw_statuses, list):
+        return normalized
+    statuses: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in raw_statuses:
+        if not isinstance(raw, dict):
+            continue
+        point_id = " ".join(str(raw.get("weak_point_id") or "").split())
+        status = str(raw.get("status") or "").strip()
+        if (
+            not point_id
+            or point_id in seen
+            or status not in {
+                "confirmed", "suspected", "reported_fixed", "not_mentioned",
+            }
+        ):
+            continue
+        seen.add(point_id)
+        statuses.append({
+            "weak_point_id": point_id,
+            "status": status,
+            "evidence": " ".join(str(raw.get("evidence") or "").split()) or None,
+        })
+    normalized["weak_point_statuses"] = statuses
+    normalized["excluded_weak_point_ids"] = [
+        entry["weak_point_id"]
+        for entry in statuses
+        if entry["status"] == "reported_fixed"
+    ]
+    normalized["relevant_weak_point_ids"] = [
+        entry["weak_point_id"]
+        for entry in statuses
+        if entry["status"] in {"confirmed", "suspected"}
+    ]
+    return normalized
 
 
 def _term_matches_haystack(term: str, haystack: str) -> bool:
@@ -617,23 +856,75 @@ def _term_matches_haystack(term: str, haystack: str) -> bool:
 
 
 def offer_matches_repair_part(offer: dict[str, Any], repair_part: dict[str, Any]) -> bool:
-    haystack = normalize_vehicle(" ".join(filter(None, (
+    return offer_repair_part_score(offer, repair_part) is not None
+
+
+def offer_repair_part_score(
+    offer: dict[str, Any],
+    repair_part: dict[str, Any],
+) -> int | None:
+    """Score an offer by where a precise part term matched."""
+    title = normalize_vehicle(str(offer.get("name") or ""))
+    taxonomy = normalize_vehicle(" ".join(filter(None, (
         offer.get("category"), offer.get("subcategory"),
-        offer.get("name"), offer.get("description"),
     ))))
+    description = normalize_vehicle(str(offer.get("description") or ""))
+    haystack = title + taxonomy + description
     if any(
         _term_matches_haystack(str(term), haystack)
         for term in repair_part.get("exclude_terms") or []
     ):
-        return False
+        return None
     terms = repair_part.get("search_terms") or [repair_part.get("name")]
-    return any(_term_matches_haystack(str(term), haystack) for term in terms if term)
+    scores = []
+    for term in terms:
+        if not term:
+            continue
+        if _term_matches_haystack(str(term), title):
+            scores.append(100 + min(len(normalize_vehicle(str(term))), 30))
+        elif _term_matches_haystack(str(term), taxonomy):
+            scores.append(65)
+        elif _term_matches_haystack(str(term), description):
+            scores.append(25)
+    if not scores:
+        return None
+    part_type = str(repair_part.get("part_type") or "")
+    part_name = str(repair_part.get("name") or "").casefold()
+    if (part_type.endswith("_kit") or "комплект" in part_name) and not (
+        "комплект" in str(offer.get("name") or "").casefold()
+        or "набор" in str(offer.get("name") or "").casefold()
+    ):
+        return None
+    return max(scores)
 
 
-def listing_spare_parts_payload(
+def _offer_has_conflicting_vehicle_model(
+    offer: dict[str, Any],
+    brand: str,
+    model: str,
+) -> bool:
+    """Reject an explicitly named different BMW series while allowing generic offers."""
+    if normalize_vehicle(brand) != "bmw":
+        return False
+    title = str(offer.get("name") or "")
+    explicit = re.search(r"\bBMW\s+(X\d|[1-8](?:[- ]?Series)?)\b", title, re.I)
+    if not explicit:
+        return False
+    requested = normalize_vehicle(model)
+    named = normalize_vehicle(explicit.group(1))
+    requested_number = re.search(r"[1-8]", requested)
+    named_number = re.search(r"[1-8]", named)
+    return (
+        named.startswith("x") != requested.startswith("x")
+        or bool(requested_number and named_number and requested_number.group() != named_number.group())
+    )
+
+
+def matching_vehicle_spare_part_offers(
     repository: Any,
     item: dict[str, Any],
-) -> dict[str, Any]:
+) -> tuple[list[dict[str, Any]], int | None, str]:
+    """Load compatible offers once and report how strict the filter was."""
     attributes = item.get("attributes") or {}
     generation = drom_generation(
         attributes.get("Поколение") or attributes.get("Generation")
@@ -642,83 +933,299 @@ def listing_spare_parts_payload(
         str(item.get("model") or ""),
         item.get("year"),
     )
+    requested_fuel = attributes.get("Тип двигателя") or attributes.get("Топливо")
+    requested_volume = (
+        attributes.get("Объём двигателя")
+        or attributes.get("Объем двигателя")
+    )
     offers = repository.matching_spare_part_offers(
         item.get("brand"),
         item.get("model"),
         year=item.get("year"),
-        fuel=attributes.get("Тип двигателя"),
-        engine_volume=attributes.get("Объём двигателя"),
+        fuel=requested_fuel,
+        engine_volume=requested_volume,
         generation=generation,
     )
+    compatibility_scope = (
+        "vehicle_filters"
+        if requested_fuel or requested_volume
+        else "model_generation_only"
+    )
     if not offers:
+        compatibility_scope = "model_generation_only"
         offers = repository.matching_spare_part_offers(
             item.get("brand"),
             item.get("model"),
             year=item.get("year"),
             generation=generation,
         )
+    return offers, generation, compatibility_scope
+
+
+def listing_spare_parts_payload(
+    repository: Any,
+    item: dict[str, Any],
+    *,
+    include_analysis_catalog: bool = False,
+) -> dict[str, Any]:
+    attributes = item.get("attributes") or {}
+    offers, generation, compatibility_scope = matching_vehicle_spare_part_offers(
+        repository,
+        item,
+    )
     analysis = normalize_vehicle_analysis_parts(
         (item.get("vehicle_analysis") or {}).get("data") or {}
     )
     assessment = (item.get("listing_assessment") or {}).get("data") or {}
     excluded = set(assessment.get("excluded_weak_point_ids") or [])
     relevant = set(assessment.get("relevant_weak_point_ids") or [])
+    status_by_id = {
+        entry.get("weak_point_id"): entry
+        for entry in assessment.get("weak_point_statuses") or []
+        if isinstance(entry, dict) and entry.get("weak_point_id")
+    }
+    has_structured_statuses = bool(status_by_id)
     matches: list[dict[str, Any]] = []
     chosen_ids: set[int] = set()
     parts_total = 0
+    parts_max = 0
     labor_min = 0
     labor_max = 0
+    reserve_parts_min = 0
+    reserve_parts_max = 0
+    reserve_labor_min = 0
+    reserve_labor_max = 0
+    offers_by_id = {
+        offer_id: offer
+        for offer in offers
+        if (offer_id := _positive_integer(offer.get("id"))) is not None
+    }
     for point in analysis.get("weak_points") or []:
         point_id = point.get("id")
-        if point_id and point_id in excluded:
-            continue
-        if relevant and point_id and point_id not in relevant:
-            continue
+        status_entry = status_by_id.get(point_id) or {}
+        point_status = status_entry.get("status")
+        if point_status not in {
+            "confirmed", "suspected", "reported_fixed", "not_mentioned",
+        }:
+            point_status = None
+        if not point_status:
+            if point_id and point_id in excluded:
+                point_status = "reported_fixed"
+            elif relevant and point_id in relevant:
+                point_status = "suspected"
+            else:
+                point_status = "not_mentioned"
+        is_current_investment = (
+            point_status in {"confirmed", "suspected"}
+            if has_structured_statuses
+            else not (point_id and point_id in excluded)
+            and (not relevant or not point_id or point_id in relevant)
+        )
         repair_parts = point.get("repair_parts") or []
         matched: list[dict[str, Any]] = []
         selected_ids: list[int] = []
+        matched_repair_parts = 0
+        priced_repair_parts = 0
+        point_parts_total = 0
+        billable_parts_total = 0
         for repair_part in repair_parts:
-            part_matches = [
-                {**offer, "matched_repair_part": repair_part.get("name")}
-                for offer in offers
-                if offer_matches_repair_part(offer, repair_part)
-            ][:3]
+            requested_ids = repair_part.get("catalog_offer_ids") or []
+            scored_matches = [
+                {
+                    **offers_by_id[offer_id],
+                    "matched_repair_part": repair_part.get("name"),
+                    "match_score": 1000,
+                    "match_confidence": "catalog_exact",
+                    "matched_by": "catalog_offer_id",
+                }
+                for raw_offer_id in requested_ids
+                if (offer_id := _positive_integer(raw_offer_id)) in offers_by_id
+                and not _offer_has_conflicting_vehicle_model(
+                    offers_by_id[offer_id],
+                    str(item.get("brand") or ""),
+                    str(item.get("model") or ""),
+                )
+            ]
+            if not scored_matches:
+                for offer in offers:
+                    if _offer_has_conflicting_vehicle_model(
+                        offer,
+                        str(item.get("brand") or ""),
+                        str(item.get("model") or ""),
+                    ):
+                        continue
+                    score = offer_repair_part_score(offer, repair_part)
+                    if score is None:
+                        continue
+                    scored_matches.append({
+                        **offer,
+                        "matched_repair_part": repair_part.get("name"),
+                        "match_score": score,
+                        "match_confidence": "exact" if score >= 100 else "possible",
+                        "matched_by": "search_terms",
+                    })
+            part_matches = sorted(
+                scored_matches,
+                key=lambda offer: (
+                    -int(offer["match_score"]),
+                    offer.get("price") is None,
+                    offer.get("price") or 0,
+                ),
+            )[:3]
+            if part_matches:
+                matched_repair_parts += 1
             matched.extend(
                 offer for offer in part_matches
                 if offer["id"] not in {existing["id"] for existing in matched}
             )
             chosen_part = next(
-                (offer for offer in part_matches if offer.get("price") is not None),
-                part_matches[0] if part_matches else None,
+                (
+                    offer for offer in part_matches
+                    if offer.get("price") is not None and offer["match_score"] >= 100
+                ),
+                None,
             )
-            if chosen_part and chosen_part["id"] not in chosen_ids:
-                chosen_ids.add(chosen_part["id"])
-                selected_ids.append(chosen_part["id"])
-                parts_total += chosen_part.get("price") or 0
-        if not matched:
-            continue
+            if chosen_part:
+                priced_repair_parts += 1
+                if chosen_part["id"] not in selected_ids:
+                    selected_ids.append(chosen_part["id"])
+                    point_parts_total += chosen_part.get("price") or 0
+                if chosen_part["id"] not in chosen_ids:
+                    chosen_ids.add(chosen_part["id"])
+                    billable_parts_total += chosen_part.get("price") or 0
+        estimated_parts_min = int(point.get("parts_cost_min") or 0)
+        estimated_parts_max = int(
+            point.get("parts_cost_max") or estimated_parts_min
+        )
+        catalog_priced = bool(repair_parts) and priced_repair_parts == len(repair_parts)
+        point_parts_min = (
+            billable_parts_total
+            if catalog_priced
+            else max(billable_parts_total, estimated_parts_min)
+        )
+        point_parts_max = (
+            billable_parts_total
+            if catalog_priced
+            else max(billable_parts_total, estimated_parts_max, point_parts_min)
+        )
         point_labor_min = int(point.get("labor_cost_min") or 0)
         point_labor_max = int(point.get("labor_cost_max") or point_labor_min)
-        labor_min += point_labor_min
-        labor_max += point_labor_max
+        if is_current_investment:
+            parts_total += point_parts_min
+            parts_max += point_parts_max
+            labor_min += point_labor_min
+            labor_max += point_labor_max
+        elif point_status != "reported_fixed":
+            reserve_parts_min += point_parts_min
+            reserve_parts_max += point_parts_max
+            reserve_labor_min += point_labor_min
+            reserve_labor_max += point_labor_max
         matches.append({
             "weak_point_id": point_id,
             "title": " — ".join(filter(None, (point.get("system"), point.get("issue")))) or "Слабое место",
+            "listing_status": point_status,
+            "status_evidence": status_entry.get("evidence"),
+            "cost_role": (
+                "current"
+                if is_current_investment
+                else "resolved"
+                if point_status == "reported_fixed"
+                else "reserve"
+            ),
             "offers": matched,
             "selected_offer_id": selected_ids[0] if selected_ids else None,
             "selected_offer_ids": selected_ids,
             "repair_parts": repair_parts,
+            "catalog_coverage": {
+                "requested_parts": len(repair_parts),
+                "matched_parts": matched_repair_parts,
+                "priced_parts": priced_repair_parts,
+                "complete": catalog_priced,
+            },
+            "parts_cost_min": point_parts_total if catalog_priced else point_parts_min,
+            "parts_cost_max": point_parts_total if catalog_priced else point_parts_max,
         })
-    estimated = assessment.get("parts_investment_total") or analysis.get("estimated_initial_investment") or {}
+    structured_budget = assessment.get("investment_budget") or {}
+
+    def budget_section(name: str) -> dict[str, int] | None:
+        raw = structured_budget.get(name)
+        if not isinstance(raw, dict) or not any(
+            raw.get(key) is not None
+            for key in (
+                "parts_min", "parts_max", "labor_min", "labor_max",
+                "total_min", "total_max",
+            )
+        ):
+            return None
+        section_parts_min = _money_amount(raw.get("parts_min"))
+        section_parts_max = max(
+            section_parts_min,
+            _money_amount(raw.get("parts_max"), section_parts_min),
+        )
+        section_labor_min = _money_amount(raw.get("labor_min"))
+        section_labor_max = max(
+            section_labor_min,
+            _money_amount(raw.get("labor_max"), section_labor_min),
+        )
+        calculated_min = section_parts_min + section_labor_min
+        calculated_max = section_parts_max + section_labor_max
+        total_min = max(calculated_min, _money_amount(raw.get("total_min")))
+        return {
+            "parts_min": section_parts_min,
+            "parts_max": section_parts_max,
+            "labor_min": section_labor_min,
+            "labor_max": section_labor_max,
+            "total_min": total_min,
+            "total_max": max(
+                calculated_max,
+                _money_amount(raw.get("total_max")),
+                total_min,
+            ),
+        }
+
+    immediate_budget = budget_section("immediate")
+    preventive_budget = budget_section("preventive")
+    risk_budget = budget_section("risk_reserve")
+    estimated = (
+        {}
+        if has_structured_statuses
+        else assessment.get("parts_investment_total")
+        or analysis.get("estimated_initial_investment")
+        or {}
+    )
     estimated_min = int(estimated.get("min") or 0) if isinstance(estimated, dict) else 0
     estimated_max = int(estimated.get("max") or estimated_min) if isinstance(estimated, dict) else estimated_min
     live_min = parts_total + labor_min
-    live_max = parts_total + labor_max
-    investment_min = max(live_min, estimated_min)
-    investment_max = max(live_max, estimated_max, investment_min)
+    live_max = parts_max + labor_max
+    immediate_min = max(
+        live_min,
+        immediate_budget["total_min"] if immediate_budget else 0,
+        estimated_min,
+    )
+    immediate_max = max(
+        live_max,
+        immediate_budget["total_max"] if immediate_budget else 0,
+        estimated_max,
+        immediate_min,
+    )
+    preventive_min = preventive_budget["total_min"] if preventive_budget else 0
+    preventive_max = preventive_budget["total_max"] if preventive_budget else 0
+    investment_min = immediate_min + preventive_min
+    investment_max = max(immediate_max + preventive_max, investment_min)
+    if risk_budget:
+        reserve_parts_min = risk_budget["parts_min"]
+        reserve_parts_max = risk_budget["parts_max"]
+        reserve_labor_min = risk_budget["labor_min"]
+        reserve_labor_max = risk_budget["labor_max"]
+        reserve_min = risk_budget["total_min"]
+        reserve_max = risk_budget["total_max"]
+    else:
+        reserve_min = reserve_parts_min + reserve_labor_min
+        reserve_max = reserve_parts_max + reserve_labor_max
     purchase_price = int(item.get("price") or 0)
-    return {
+    result = {
         "offers_count": len(offers),
+        "compatibility_scope": compatibility_scope,
         "compatible_offers": offers[:12],
         "matches": matches,
         "search_url": build_drom_parts_url(
@@ -733,13 +1240,32 @@ def listing_spare_parts_payload(
         ),
         "costs": {
             "parts": parts_total,
+            "parts_max": parts_max,
             "labor_min": labor_min,
             "labor_max": labor_max,
             "service_min": live_min,
             "service_max": live_max,
+            "immediate_min": immediate_min,
+            "immediate_max": immediate_max,
+            "preventive_min": preventive_min,
+            "preventive_max": preventive_max,
             "investment_min": investment_min,
             "investment_max": investment_max,
             "total_entry_min": purchase_price + investment_min,
             "total_entry_max": purchase_price + investment_max,
+            "risk_reserve_parts_min": reserve_parts_min,
+            "risk_reserve_parts_max": reserve_parts_max,
+            "risk_reserve_labor_min": reserve_labor_min,
+            "risk_reserve_labor_max": reserve_labor_max,
+            "risk_reserve_min": reserve_min,
+            "risk_reserve_max": reserve_max,
+            "total_with_risk_reserve_min": purchase_price + investment_min + reserve_min,
+            "total_with_risk_reserve_max": purchase_price + investment_max + reserve_max,
         },
     }
+    if include_analysis_catalog:
+        result["analysis_catalog"] = analysis_parts_catalog(
+            offers,
+            compatibility_scope=compatibility_scope,
+        )
+    return result

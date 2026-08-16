@@ -16,12 +16,15 @@ from urllib.request import Request, urlopen
 from auto_parser.models import utc_now_iso
 from auto_parser.spare_parts import (
     SparePartOffer,
+    analysis_parts_catalog,
     build_drom_parts_url,
+    drom_parts_url_with_filters,
     drom_generation,
     generation_for_year,
     is_drom_verification_page,
     known_drom_generation,
     listing_spare_parts_payload,
+    matching_vehicle_spare_part_offers,
     nested_categories_for_analysis,
     parse_drom_part_description,
     parse_drom_parts_index,
@@ -114,6 +117,62 @@ def _database(path: Path) -> Iterator[sqlite3.Connection]:
 
 class PartsApiMixin:
     database: Path
+
+    def _vehicle_analysis_context(self, query: dict[str, list[str]]) -> None:
+        source = query.get("source", [""])[0].strip().lower()
+        external_id = query.get("external_id", [""])[0].strip()
+        if source not in {"avito", "auto_ru", "drom"} or not external_id:
+            self._json(
+                {"error": "Некорректное объявление"},
+                HTTPStatus.BAD_REQUEST,
+            )
+            return
+        with ListingRepository(self.database) as repository:
+            car = repository.get_listing(source, external_id)
+            if car is None:
+                self._json(
+                    {"error": "Автомобиль не найден"},
+                    HTTPStatus.NOT_FOUND,
+                )
+                return
+            if not car.brand or not car.model:
+                self._json(
+                    {"error": "В карточке не определены марка и модель"},
+                    HTTPStatus.BAD_REQUEST,
+                )
+                return
+            attributes = car.attributes or {}
+            year_match = re.search(
+                r"\b((?:19|20)\d{2})\b",
+                str(attributes.get("Год выпуска") or car.title),
+            )
+            year = int(year_match.group(1)) if year_match else None
+            item = {
+                "brand": car.brand,
+                "model": car.model,
+                "year": year,
+                "price": car.price,
+                "attributes": attributes,
+            }
+            offers, _, compatibility_scope = matching_vehicle_spare_part_offers(
+                repository,
+                item,
+            )
+            parts_catalog = analysis_parts_catalog(
+                offers,
+                compatibility_scope=compatibility_scope,
+            )
+        self._json({
+            "vehicle": {
+                "brand": car.brand,
+                "model": car.model,
+                "year": year,
+                "mileage_km": car.mileage_km,
+                "price_rub": car.price,
+                "attributes": attributes,
+            },
+            "parts_catalog": parts_catalog,
+        })
 
     @staticmethod
     def _download_spare_parts_html(url: str) -> str:
@@ -415,12 +474,17 @@ class PartsApiMixin:
             engine_volume=volume,
         )
         categories = list(DROM_PART_CATEGORIES)
+        discovered_category_links: dict[str, str] = {}
         warning: str | None = None
         try:
             discovery_html = self._download_spare_parts_html(discovery_url)
             index = parse_drom_parts_index(discovery_html)
             generation = generation or generation_for_year(index, year)
             categories = index.categories or categories
+            discovered_category_links = {
+                " ".join(link["category"].casefold().replace("ё", "е").split()): link["url"]
+                for link in index.category_links
+            }
         except DromVerificationRequired as error:
             self._json(
                 {
@@ -448,20 +512,32 @@ class PartsApiMixin:
             *nested_categories,
             *(category for category in categories if category not in nested_categories),
         ]
-        category_links = [
-            {
-                "category": category,
-                "url": build_drom_parts_url(
+        category_links: list[dict[str, str]] = []
+        seen_category_urls: set[str] = set()
+        for category in category_names:
+            key = " ".join(category.casefold().replace("ё", "е").split())
+            discovered_url = discovered_category_links.get(key)
+            url = (
+                drom_parts_url_with_filters(
+                    discovered_url,
+                    fuel=fuel,
+                    generation=generation,
+                    engine_volume=volume,
+                )
+                if discovered_url
+                else build_drom_parts_url(
                     car.brand,
                     car.model,
                     category=category,
                     fuel=fuel,
                     generation=generation,
                     engine_volume=volume,
-                ),
-            }
-            for category in category_names
-        ]
+                )
+            )
+            if url in seen_category_urls:
+                continue
+            seen_category_urls.add(url)
+            category_links.append({"category": category, "url": url})
         links = [{"category": "Все запчасти", "url": base_url}, *category_links]
 
         # Only directly relevant nested tags are fetched automatically. The

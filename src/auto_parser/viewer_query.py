@@ -66,7 +66,12 @@ def build_filters(
     *,
     apply_visibility: bool = False,
     default_status: str | None = None,
+    default_statuses: tuple[str, ...] | None = None,
 ) -> tuple[str, list[Any]]:
+    if default_status is not None and default_statuses is not None:
+        raise ValueError(
+            "Укажите либо default_status, либо default_statuses"
+        )
     conditions: list[str] = []
     values: list[Any] = []
     source_hidden = False
@@ -138,9 +143,19 @@ def build_filters(
     if status:
         conditions.append("l.status = ?")
         values.append(status)
-    elif default_status and not source_hidden:
-        conditions.append("l.status = ?")
-        values.append(default_status)
+    elif not source_hidden:
+        statuses = (
+            (default_status,)
+            if default_status is not None
+            else tuple(dict.fromkeys(default_statuses or ()))
+        )
+        if len(statuses) == 1:
+            conditions.append("l.status = ?")
+            values.append(statuses[0])
+        elif statuses:
+            placeholders = ", ".join("?" for _ in statuses)
+            conditions.append(f"l.status IN ({placeholders})")
+            values.extend(statuses)
 
     for parameter, attribute_name in ATTRIBUTE_FILTERS.items():
         selected = [

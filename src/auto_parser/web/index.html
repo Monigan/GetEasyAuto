@@ -506,7 +506,7 @@
         <nav id="sold-pagination" class="pagination" aria-label="Страницы архива продаж"></nav>
         <div id="sold-empty" class="empty" hidden>
           <strong>Проданных объявлений пока нет</strong>
-          <p>Они появятся после фоновой проверки недоступных или снятых карточек.</p>
+          <p>Они появятся, когда площадка явно сообщит о продаже автомобиля.</p>
         </div>
       </section>
 
@@ -792,7 +792,7 @@
             <div class="vehicle-analysis-heading">
               <div>
                 <h3>Слабые места и вложения</h3>
-                <p>Общие неисправности сохраняются для модели, а ТО и вложения из описания — только для этого объявления. Цены учитывают только запчасти.</p>
+                <p>Типовые риски отделены от подтверждённых вложений. Анализ связывает ремонт с уже импортированными запчастями и отдельно показывает детали, работы и резерв.</p>
               </div>
               <span id="vehicle-analysis-state"></span>
             </div>
@@ -802,13 +802,13 @@
             </label>
             <div id="vehicle-analysis-result" class="vehicle-analysis-result"></div>
             <div class="vehicle-analysis-actions">
-              <button id="vehicle-prompt-copy" class="ghost-button" type="button">Скопировать промт</button>
+              <button id="vehicle-prompt-copy" class="ghost-button" type="button">Скопировать промт с базой</button>
               <a class="ghost-link" href="https://chatgpt.com/" target="_blank" rel="noopener noreferrer">Открыть ChatGPT ↗</a>
             </div>
             <details class="vehicle-analysis-import">
               <summary>Добавить ответ в базу</summary>
               <p>Вставьте JSON, который вернул ChatGPT.</p>
-              <textarea id="vehicle-analysis-json" rows="9" spellcheck="false" placeholder='{"summary":"…","weak_points":[],"purchase_checklist":[],"parts":[],"estimated_initial_investment":{"min":0,"max":0,"notes":"…"}}'></textarea>
+              <textarea id="vehicle-analysis-json" rows="9" spellcheck="false" placeholder='{"model_analysis":{"summary":"…","weak_points":[]},"listing_assessment":{"weak_point_statuses":[],"investment_items":[],"investment_budget":{}}}'></textarea>
               <button id="vehicle-analysis-save" class="primary-button" type="button">Сохранить анализ</button>
             </details>
           </section>

@@ -10,6 +10,10 @@ from auto_parser.activity import (
     set_listing_activity,
 )
 from auto_parser.mail_ingest import AutoRuMailImporter, MailImportConfig
+from auto_parser.models import (
+    LISTING_STATUS_REMOVED,
+    LISTING_UNPUBLISHED_HTTP_STATUSES,
+)
 from auto_parser.request_governor import (
     RequestDeferredError,
     RequestGovernor,
@@ -393,6 +397,13 @@ class BackgroundScheduler:
                         listing.external_id,
                         listing.last_validated_at or _iso(),
                     )
+                elif status == LISTING_STATUS_REMOVED:
+                    repository.mark_unpublished(
+                        listing.source,
+                        listing.external_id,
+                        listing.last_validated_at or _iso(),
+                        http_status=listing.unpublished_http_status,
+                    )
                 else:
                     repository.upsert_many([listing])
                     repository.replace_listing_images(listing)
@@ -528,6 +539,28 @@ class BackgroundScheduler:
                 )
                 break
             except HttpSourceError as error:
+                if error.status_code in LISTING_UNPUBLISHED_HTTP_STATUSES:
+                    detected_at = listing.last_validated_at or _iso()
+                    with ListingRepository(self.database) as repository:
+                        repository.mark_unpublished(
+                            listing.source,
+                            listing.external_id,
+                            detected_at,
+                            http_status=error.status_code,
+                        )
+                    finish_listing_activity(
+                        listing.source,
+                        listing.external_id,
+                        "Объявление снято с публикации",
+                        priority=activity_priority,
+                        state="success",
+                    )
+                    logger.info(
+                        "Карточка %s снята с публикации: HTTP %d",
+                        listing.external_id,
+                        error.status_code,
+                    )
+                    continue
                 if error.status_code in DETAIL_RETRYABLE_HTTP_STATUSES:
                     if error.status_code == last_rate_limit_status:
                         consecutive_rate_limits += 1
@@ -904,6 +937,15 @@ class BackgroundScheduler:
                         listing.external_id,
                         error,
                     )
+                    if error.status_code in LISTING_UNPUBLISHED_HTTP_STATUSES:
+                        with ListingRepository(self.database) as repository:
+                            repository.mark_unpublished(
+                                listing.source,
+                                listing.external_id,
+                                listing.last_validated_at or _iso(),
+                                http_status=error.status_code,
+                            )
+                        continue
                     if error.status_code in {429, 439}:
                         detail_retry = self._register_rate_limit(
                             error,

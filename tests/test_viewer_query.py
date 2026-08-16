@@ -47,6 +47,15 @@ class ViewerQueryTests(unittest.TestCase):
         self.assertEqual(where, " WHERE l.status = 'hidden'")
         self.assertEqual(values, [])
 
+    def test_supports_multiple_default_statuses_for_analytics(self) -> None:
+        where, values = build_filters(
+            {},
+            default_statuses=("active", "removed", "active"),
+        )
+
+        self.assertEqual(where, " WHERE l.status IN (?, ?)")
+        self.assertEqual(values, ["active", "removed"])
+
     def test_integer_clamps_to_minimum(self) -> None:
         self.assertEqual(integer("-10", minimum=1), 1)
         self.assertIsNone(integer("not-a-number"))

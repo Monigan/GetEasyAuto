@@ -126,6 +126,53 @@ class SchedulerRateLimitTests(unittest.TestCase):
         self.assertIn("HTTP 403", third_activity.stage)
         self.assertIn("3/3", third_activity.stage)
 
+    def test_card_refresh_marks_404_as_unpublished_and_continues(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "test.db"
+            with ListingRepository(database) as repository:
+                repository.upsert_many(
+                    [
+                        Listing(
+                            source="avito",
+                            external_id=str(index),
+                            url=f"https://www.avito.ru/{index}",
+                            title=f"Автомобиль {index}",
+                            collected_at="2025-01-01T00:00:00+00:00",
+                        )
+                        for index in range(1, 3)
+                    ]
+                )
+            scheduler = BackgroundScheduler(
+                database=database,
+                cache_dir=Path(directory) / "cache",
+            )
+            with patch(
+                "auto_parser.scheduler.SearchService.enrich_listing_details",
+                autospec=True,
+                side_effect=HttpSourceError("avito", 404),
+            ) as enrich:
+                scheduler._refresh_listing_details()
+            with ListingRepository(database) as repository:
+                listings = [
+                    repository.get_listing("avito", str(index))
+                    for index in range(1, 3)
+                ]
+            activities = [
+                listing_activity("avito", str(index))
+                for index in range(1, 3)
+            ]
+            for index in range(1, 3):
+                clear_listing_activity("avito", str(index))
+
+        self.assertEqual(enrich.call_count, 2)
+        self.assertTrue(all(item.status == "removed" for item in listings))
+        self.assertTrue(
+            all(item.unpublished_http_status == 404 for item in listings)
+        )
+        self.assertTrue(
+            all(activity.state == "success" for activity in activities)
+        )
+
     def test_card_refresh_stops_on_first_source_error(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "test.db"

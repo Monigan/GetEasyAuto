@@ -14,7 +14,11 @@ from auto_parser.images import (
     remap_cached_avito_images,
     remap_cached_images,
 )
-from auto_parser.models import Listing
+from auto_parser.models import (
+    LISTING_STATUS_ACTIVE,
+    LISTING_STATUS_HIDDEN,
+    Listing,
+)
 from auto_parser.sqlite_support import (
     configure_sqlite_connection,
     finish_schema_migration,
@@ -74,6 +78,8 @@ class ListingRepository:
                 status TEXT NOT NULL DEFAULT 'active',
                 sold_price INTEGER,
                 sold_at TEXT,
+                unpublished_at TEXT,
+                unpublished_http_status INTEGER,
                 hidden INTEGER NOT NULL DEFAULT 0,
                 last_validated_at TEXT,
                 last_detail_attempt_at TEXT,
@@ -488,6 +494,13 @@ class ListingRepository:
                 "ALTER TABLE listings ADD COLUMN sold_price INTEGER"
             ),
             "sold_at": "ALTER TABLE listings ADD COLUMN sold_at TEXT",
+            "unpublished_at": (
+                "ALTER TABLE listings ADD COLUMN unpublished_at TEXT"
+            ),
+            "unpublished_http_status": (
+                "ALTER TABLE listings ADD COLUMN "
+                "unpublished_http_status INTEGER"
+            ),
             "hidden": (
                 "ALTER TABLE listings ADD COLUMN "
                 "hidden INTEGER NOT NULL DEFAULT 0"
@@ -505,9 +518,10 @@ class ListingRepository:
         self.connection.execute(
             """
             UPDATE listings
-            SET status = 'sold',
-                sold_price = COALESCE(sold_price, price),
-                sold_at = COALESCE(sold_at, last_validated_at, last_seen_at)
+            SET status = 'removed', sold_price = NULL, sold_at = NULL,
+                unpublished_at = COALESCE(
+                    unpublished_at, last_validated_at, last_seen_at
+                )
             WHERE status = 'inactive'
             """
         )
@@ -528,6 +542,14 @@ class ListingRepository:
         )
         self.connection.execute(
             "CREATE INDEX IF NOT EXISTS listings_status_idx ON listings(status)"
+        )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS listings_status_seen_idx "
+            "ON listings(status, last_seen_at DESC)"
+        )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS listings_validation_idx "
+            "ON listings(status, last_validated_at)"
         )
         self.connection.execute(
             "CREATE INDEX IF NOT EXISTS listings_hidden_idx ON listings(hidden)"
@@ -730,8 +752,9 @@ class ListingRepository:
                     source, external_id, url, title, price, currency, description,
                     mileage_km, brand, model, views_count, attributes_json,
                     location, published_at, status, last_validated_at,
-                    sold_price, sold_at, first_seen_at, last_seen_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    sold_price, sold_at, unpublished_at,
+                    unpublished_http_status, first_seen_at, last_seen_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(source, external_id) DO UPDATE SET
                     url = excluded.url,
                     title = excluded.title,
@@ -771,6 +794,24 @@ class ListingRepository:
                                       excluded.last_seen_at)
                         ELSE NULL
                     END,
+                    unpublished_at = CASE
+                        WHEN excluded.status = 'removed'
+                        THEN COALESCE(
+                            excluded.unpublished_at,
+                            listings.unpublished_at,
+                            excluded.last_validated_at,
+                            excluded.last_seen_at
+                        )
+                        ELSE NULL
+                    END,
+                    unpublished_http_status = CASE
+                        WHEN excluded.status = 'removed'
+                        THEN COALESCE(
+                            excluded.unpublished_http_status,
+                            listings.unpublished_http_status
+                        )
+                        ELSE NULL
+                    END,
                     last_validated_at = COALESCE(
                         excluded.last_validated_at, listings.last_validated_at
                     ),
@@ -795,6 +836,8 @@ class ListingRepository:
                     listing.last_validated_at,
                     listing.sold_price,
                     listing.sold_at,
+                    listing.unpublished_at,
+                    listing.unpublished_http_status,
                     listing.collected_at,
                     listing.collected_at,
                 ),
@@ -1458,6 +1501,9 @@ class ListingRepository:
         description_snapshot: str | None,
         updated_at: str,
     ) -> None:
+        from auto_parser.spare_parts import normalize_listing_assessment
+
+        assessment = normalize_listing_assessment(assessment)
         self.connection.execute(
             """
             INSERT INTO listing_vehicle_assessments (
@@ -1675,8 +1721,13 @@ class ListingRepository:
         source: str | None = None,
         displayed_since: str | None = None,
     ) -> list[Listing]:
-        conditions = ["status IN ('active', 'hidden')"]
-        values: list[Any] = []
+        conditions = [
+            "status IN (?, ?)"
+        ]
+        values: list[Any] = [
+            LISTING_STATUS_ACTIVE,
+            LISTING_STATUS_HIDDEN,
+        ]
         if source is not None:
             conditions.append("source = ?")
             values.append(source)
@@ -1948,7 +1999,8 @@ class ListingRepository:
             UPDATE listings
             SET status = 'sold', sold_price = COALESCE(sold_price, price),
                 sold_at = COALESCE(sold_at, ?), last_validated_at = ?,
-                last_seen_at = ?
+                last_seen_at = ?, unpublished_at = NULL,
+                unpublished_http_status = NULL
             WHERE source = ? AND external_id = ?
             """,
             (validated_at, validated_at, validated_at, source, external_id),
@@ -1958,7 +2010,37 @@ class ListingRepository:
     def mark_inactive(
         self, source: str, external_id: str, validated_at: str
     ) -> None:
-        self.mark_sold(source, external_id, validated_at)
+        self.mark_unpublished(source, external_id, validated_at)
+
+    def mark_unpublished(
+        self,
+        source: str,
+        external_id: str,
+        validated_at: str,
+        *,
+        http_status: int | None = None,
+    ) -> None:
+        self.connection.execute(
+            """
+            UPDATE listings
+            SET status = 'removed', sold_price = NULL, sold_at = NULL,
+                unpublished_at = COALESCE(unpublished_at, ?),
+                unpublished_http_status = COALESCE(
+                    ?, unpublished_http_status
+                ), last_validated_at = ?,
+                last_seen_at = ?
+            WHERE source = ? AND external_id = ?
+            """,
+            (
+                validated_at,
+                http_status,
+                validated_at,
+                validated_at,
+                source,
+                external_id,
+            ),
+        )
+        self.connection.commit()
 
     def set_sold_price(
         self, source: str, external_id: str, sold_price: int
@@ -1967,7 +2049,8 @@ class ListingRepository:
             """
             UPDATE listings
             SET sold_price = ?, status = 'sold',
-                sold_at = COALESCE(sold_at, last_validated_at, last_seen_at)
+                sold_at = COALESCE(sold_at, last_validated_at, last_seen_at),
+                unpublished_at = NULL, unpublished_http_status = NULL
             WHERE source = ? AND external_id = ?
             """,
             (sold_price, source, external_id),
@@ -2138,6 +2221,8 @@ class ListingRepository:
             status=row["status"],
             sold_price=row["sold_price"],
             sold_at=row["sold_at"],
+            unpublished_at=row["unpublished_at"],
+            unpublished_http_status=row["unpublished_http_status"],
             last_validated_at=row["last_validated_at"],
             collected_at=row["last_seen_at"],
         )

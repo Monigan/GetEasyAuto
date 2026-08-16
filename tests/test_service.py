@@ -109,6 +109,61 @@ class SearchPaginationTests(unittest.TestCase):
         self.assertIsNone(listing.sold_price)
         self.assertIsNone(listing.sold_at)
 
+    def test_validation_marks_http_404_as_unpublished_not_sold(self) -> None:
+        service = SearchService(
+            AvitoSource(region="tver"),
+            check_robots=False,
+        )
+        listing = Listing(
+            source="avito",
+            external_id="missing",
+            url="https://www.avito.ru/item_missing",
+            title="Снятый автомобиль",
+            price=900_000,
+            sold_price=850_000,
+            sold_at="2026-07-29T12:00:00+00:00",
+        )
+
+        with patch.object(
+            SearchService,
+            "_fetch_html",
+            side_effect=HttpSourceError("avito", 404),
+        ):
+            status = service.validate_listing(listing)
+
+        self.assertEqual(status, "removed")
+        self.assertEqual(listing.status, "removed")
+        self.assertIsNone(listing.sold_price)
+        self.assertIsNone(listing.sold_at)
+        self.assertEqual(listing.unpublished_http_status, 404)
+        self.assertIsNotNone(listing.unpublished_at)
+        self.assertEqual(listing.last_validated_at, listing.unpublished_at)
+
+    def test_retryable_http_error_does_not_change_listing_status(self) -> None:
+        service = SearchService(
+            AvitoSource(region="tver"),
+            check_robots=False,
+        )
+        listing = Listing(
+            source="avito",
+            external_id="limited",
+            url="https://www.avito.ru/item_limited",
+            title="Временно недоступный автомобиль",
+            price=900_000,
+        )
+
+        with patch.object(
+            SearchService,
+            "_fetch_html",
+            side_effect=HttpSourceError("avito", 429),
+        ):
+            with self.assertRaises(HttpSourceError):
+                service.validate_listing(listing)
+
+        self.assertEqual(listing.status, "active")
+        self.assertIsNone(listing.unpublished_at)
+        self.assertIsNone(listing.unpublished_http_status)
+
     def test_cache_reuses_file_for_another_variant_of_same_photo(self) -> None:
         first = (
             "https://40.img.avito.st/image/1/1."

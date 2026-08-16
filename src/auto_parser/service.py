@@ -22,8 +22,15 @@ from auto_parser.images import (
     image_identity,
     is_supported_image_url,
 )
-from auto_parser.models import Listing
-from auto_parser.models import utc_now_iso
+from auto_parser.models import (
+    LISTING_STATUS_ACTIVE,
+    LISTING_STATUS_HIDDEN,
+    LISTING_STATUS_REMOVED,
+    LISTING_STATUS_SOLD,
+    LISTING_UNPUBLISHED_HTTP_STATUSES,
+    Listing,
+    utc_now_iso,
+)
 from auto_parser.request_governor import (
     RequestDeferredError,
     RequestGovernor,
@@ -221,42 +228,73 @@ class SearchService:
         request_kind: str = "detail",
     ) -> Listing:
         self._check_allowed(listing.url)
-        html = self._fetch_html(
-            listing.url,
-            request_kind=request_kind,
-        )
-        return self.source.enrich_listing(listing, html)
+        try:
+            html = self._fetch_html(
+                listing.url,
+                request_kind=request_kind,
+            )
+        except HttpSourceError as error:
+            self._apply_unpublished_http_status(listing, error)
+            raise
+        self.source.enrich_listing(listing, html)
+        self._normalize_listing_status(listing)
+        return listing
 
     def validate_listing(self, listing: Listing) -> str:
         try:
-            self._check_allowed(listing.url)
-            html = self._fetch_html(
-                listing.url,
+            self.enrich_listing_details(
+                listing,
                 request_kind="validation",
             )
-            self.source.enrich_listing(listing, html)
-            if listing.status in {"inactive", "sold"}:
-                listing.status = "sold"
-                listing.sold_price = listing.sold_price or listing.price
-                listing.sold_at = listing.sold_at or utc_now_iso()
-                listing.last_validated_at = listing.sold_at
-                return "sold"
-            if listing.status == "hidden":
-                listing.sold_price = None
-                listing.sold_at = None
-                listing.last_validated_at = (
-                    listing.last_validated_at or utc_now_iso()
-                )
-                return "hidden"
-            return "active"
         except HttpSourceError as error:
-            if error.status_code in {404, 410}:
-                listing.status = "sold"
-                listing.sold_price = listing.price
-                listing.sold_at = utc_now_iso()
-                listing.last_validated_at = utc_now_iso()
-                return "sold"
+            if error.status_code in LISTING_UNPUBLISHED_HTTP_STATUSES:
+                return LISTING_STATUS_REMOVED
             raise
+        return listing.status
+
+    @staticmethod
+    def _apply_unpublished_http_status(
+        listing: Listing,
+        error: HttpSourceError,
+    ) -> bool:
+        if error.status_code not in LISTING_UNPUBLISHED_HTTP_STATUSES:
+            return False
+        detected_at = utc_now_iso()
+        listing.status = LISTING_STATUS_REMOVED
+        listing.sold_price = None
+        listing.sold_at = None
+        listing.unpublished_at = listing.unpublished_at or detected_at
+        listing.unpublished_http_status = error.status_code
+        listing.last_validated_at = detected_at
+        return True
+
+    @staticmethod
+    def _normalize_listing_status(listing: Listing) -> None:
+        validated_at = listing.last_validated_at or utc_now_iso()
+        listing.last_validated_at = validated_at
+        if listing.status == LISTING_STATUS_SOLD:
+            listing.sold_price = listing.sold_price or listing.price
+            listing.sold_at = listing.sold_at or validated_at
+            listing.unpublished_at = None
+            listing.unpublished_http_status = None
+            return
+        if listing.status in {"inactive", LISTING_STATUS_REMOVED}:
+            listing.status = LISTING_STATUS_REMOVED
+            listing.sold_price = None
+            listing.sold_at = None
+            listing.unpublished_at = listing.unpublished_at or validated_at
+            return
+        if listing.status == LISTING_STATUS_HIDDEN:
+            listing.sold_price = None
+            listing.sold_at = None
+            listing.unpublished_at = None
+            listing.unpublished_http_status = None
+            return
+        listing.status = LISTING_STATUS_ACTIVE
+        listing.sold_price = None
+        listing.sold_at = None
+        listing.unpublished_at = None
+        listing.unpublished_http_status = None
 
     def cache_images(
         self,

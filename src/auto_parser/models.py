@@ -5,6 +5,17 @@ from datetime import datetime, timezone
 from typing import Any
 
 
+LISTING_STATUS_ACTIVE = "active"
+LISTING_STATUS_HIDDEN = "hidden"
+LISTING_STATUS_REMOVED = "removed"
+LISTING_STATUS_SOLD = "sold"
+LISTING_ANALYTICS_STATUSES = (
+    LISTING_STATUS_ACTIVE,
+    LISTING_STATUS_REMOVED,
+)
+LISTING_UNPUBLISHED_HTTP_STATUSES = frozenset({404, 410})
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -24,9 +35,11 @@ class Listing:
     views_count: int | None = None
     location: str | None = None
     published_at: str | None = None
-    status: str = "active"
+    status: str = LISTING_STATUS_ACTIVE
     sold_price: int | None = None
     sold_at: str | None = None
+    unpublished_at: str | None = None
+    unpublished_http_status: int | None = None
     last_validated_at: str | None = None
     collected_at: str = ""
     image_urls: list[str] = field(default_factory=list)

@@ -1478,6 +1478,20 @@ input:focus, select:focus {
 }
 .analysis-weak-point strong { display: block; }
 .analysis-weak-point small { color: var(--muted); }
+.analysis-weak-point.analysis-status-confirmed,
+.analysis-weak-point.analysis-status-suspected { border-left: 3px solid #f0b45a; }
+.analysis-weak-point.analysis-status-reported_fixed { border-left: 3px solid var(--accent); opacity: .82; }
+.analysis-weak-point.analysis-status-not_mentioned { border-left: 3px solid var(--line); }
+.analysis-repair-parts { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
+.analysis-repair-parts span { padding: 3px 6px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); font-size: 9px; }
+.analysis-catalog-gap { display: block; margin: -3px 2px 2px; color: var(--muted); font-size: 9px; }
+.analysis-listing-summary p { margin: 5px 0 0; color: var(--muted); }
+.analysis-sources a { color: var(--accent); }
+.analysis-scenario-budget > strong { display: block; margin-bottom: 7px; }
+.analysis-scenario-budget dl { margin: 0; }
+.analysis-scenario-budget dl div { display: flex; justify-content: space-between; gap: 14px; padding: 4px 0; border-bottom: 1px solid var(--line); }
+.analysis-scenario-budget dd { margin: 0; text-align: right; }
+.analysis-scenario-budget small { display: block; margin-top: 7px; color: var(--muted); }
 .vehicle-analysis-import { margin-top: 13px; }
 .vehicle-analysis-import summary { color: var(--accent); cursor: pointer; font-size: 12px; }
 .vehicle-analysis-import textarea {
